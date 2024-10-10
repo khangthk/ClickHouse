@@ -1,8 +1,9 @@
-#include <Core/SettingsChangesHistory.h>
 #include <Core/Defines.h>
+#include <Core/SettingsChangesHistory.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <boost/algorithm/string.hpp>
+
 
 namespace DB
 {
@@ -74,9 +75,29 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
             {"restore_replace_external_dictionary_source_to_null", false, false, "New setting."},
             {"show_create_query_identifier_quoting_rule", "when_necessary", "when_necessary", "New setting."},
             {"show_create_query_identifier_quoting_style", "Backticks", "Backticks", "New setting."},
+            {"output_format_native_write_json_as_string", false, false, "Add new setting to allow write JSON column as single String column in Native format"},
+            {"output_format_binary_write_json_as_string", false, false, "Add new setting to write values of JSON type as JSON string in RowBinary output format"},
+            {"input_format_binary_read_json_as_string", false, false, "Add new setting to read values of JSON type as JSON string in RowBinary input format"},
             {"enable_secure_identifiers", false, false, "New setting."},
             {"min_free_disk_bytes_to_perform_insert", 0, 0, "New setting."},
             {"min_free_disk_ratio_to_perform_insert", 0.0, 0.0, "New setting."},
+            {"cloud_mode_database_engine", 1, 1, "A setting for ClickHouse Cloud"},
+            {"allow_experimental_shared_set_join", 1, 1, "A setting for ClickHouse Cloud"},
+            {"read_through_distributed_cache", 0, 0, "A setting for ClickHouse Cloud"},
+            {"write_through_distributed_cache", 0, 0, "A setting for ClickHouse Cloud"},
+            {"distributed_cache_throw_on_error", 0, 0, "A setting for ClickHouse Cloud"},
+            {"distributed_cache_log_mode", "on_error", "on_error", "A setting for ClickHouse Cloud"},
+            {"distributed_cache_fetch_metrics_only_from_current_az", 1, 1, "A setting for ClickHouse Cloud"},
+            {"distributed_cache_connect_max_tries", 100, 100, "A setting for ClickHouse Cloud"},
+            {"distributed_cache_receive_response_wait_milliseconds", 60000, 60000, "A setting for ClickHouse Cloud"},
+            {"distributed_cache_receive_timeout_milliseconds", 10000, 10000, "A setting for ClickHouse Cloud"},
+            {"distributed_cache_wait_connection_from_pool_milliseconds", 100, 100, "A setting for ClickHouse Cloud"},
+            {"distributed_cache_bypass_connection_pool", 0, 0, "A setting for ClickHouse Cloud"},
+            {"distributed_cache_pool_behaviour_on_limit", "allocate_bypassing_pool", "allocate_bypassing_pool", "A setting for ClickHouse Cloud"},
+            {"distributed_cache_read_alignment", 0, 0, "A setting for ClickHouse Cloud"},
+            {"distributed_cache_max_unacked_inflight_packets", 10, 10, "A setting for ClickHouse Cloud"},
+            {"distributed_cache_data_packet_ack_window", 5, 5, "A setting for ClickHouse Cloud"},
+            {"max_parts_to_move", 1000, 1000, "New setting"},
         }
     },
     {"24.9",
