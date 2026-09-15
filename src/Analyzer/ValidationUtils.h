@@ -1,9 +1,16 @@
 #pragma once
 
-#include <Analyzer/IQueryTreeNode.h>
+#include <Interpreters/Context_fwd.h>
+
+#include <memory>
+#include <string_view>
+#include <unordered_map>
 
 namespace DB
 {
+
+class IQueryTreeNode;
+using QueryTreeNodePtr = std::shared_ptr<IQueryTreeNode>;
 
 /// Validate PREWHERE, WHERE, HAVING in query node
 void validateFilters(const QueryTreeNodePtr & query_node);
@@ -40,5 +47,22 @@ void assertNoFunctionNodes(const QueryTreeNodePtr & node,
 void validateTreeSize(const QueryTreeNodePtr & node,
     size_t max_size,
     std::unordered_map<QueryTreeNodePtr, size_t> & node_to_tree_size);
+
+void validateSubqueryDepth(const QueryTreeNodePtr & node, size_t initial_subquery_depth, size_t max_subquery_depth);
+
+/**
+  * Validate that correlated subqueries do not present in the context of distributed query.
+  */
+void validateCorrelatedSubqueries(const QueryTreeNodePtr & node, const ContextPtr & context);
+
+/**
+  * Validate that if correlated subquery appears in the FROM clause then it uses columns from outer query.
+  */
+void validateFromClause(const QueryTreeNodePtr & node);
+
+/** Compare node with group by key node.
+  * Such comparison does not take into account aliases, but checks types and column sources.
+  */
+bool compareGroupByKeys(const QueryTreeNodePtr & node, const QueryTreeNodePtr & group_by_key_node);
 
 }

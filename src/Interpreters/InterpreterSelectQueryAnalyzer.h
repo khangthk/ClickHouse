@@ -3,30 +3,39 @@
 #include <Interpreters/IInterpreter.h>
 #include <Interpreters/SelectQueryOptions.h>
 
-#include <Analyzer/QueryTreePassManager.h>
 #include <Planner/Planner.h>
 #include <Interpreters/Context_fwd.h>
 
 namespace DB
 {
 
+class ActionsDAG;
+class QueryPlan;
+
+struct BuiltSetsByHash;
+using BuiltSetsByHashPtr = std::shared_ptr<BuiltSetsByHash>;
+
 class InterpreterSelectQueryAnalyzer : public IInterpreter
 {
 public:
-    /// Initialize interpreter with query AST
+    /** Initialize interpreter with query AST.
+      * Optional post_filter is an outer filter pushed down from the caller (e.g. StorageView, to support skip unused shards)
+      */
     InterpreterSelectQueryAnalyzer(const ASTPtr & query_,
         const ContextPtr & context_,
         const SelectQueryOptions & select_query_options_,
-        const Names & column_names = {});
+        const Names & column_names = {},
+        const ActionsDAG * post_filter_ = nullptr);
 
     /** Initialize interpreter with query AST and storage.
       * After query tree is built left most table expression is replaced with table node that
       * is initialized with provided storage.
       */
-    InterpreterSelectQueryAnalyzer(const ASTPtr & query_,
+    InterpreterSelectQueryAnalyzer(
+        const ASTPtr & query_,
         const ContextPtr & context_,
-        const StoragePtr & storage_,
         const SelectQueryOptions & select_query_options_,
+        const StoragePtr & storage_,
         const Names & column_names = {});
 
     /** Initialize interpreter with query tree.
@@ -41,13 +50,18 @@ public:
         return context;
     }
 
-    Block getSampleBlock();
+    SharedHeader getSampleBlock();
+    std::pair<SharedHeader, PlannerContextPtr> getSampleBlockAndPlannerContext();
 
-    static Block getSampleBlock(const ASTPtr & query,
+    static SharedHeader getSampleBlock(const ASTPtr & query,
         const ContextPtr & context,
         const SelectQueryOptions & select_query_options = {});
 
-    static Block getSampleBlock(const QueryTreeNodePtr & query_tree,
+    static SharedHeader getSampleBlock(const QueryTreeNodePtr & query_tree,
+        const ContextPtr & context_,
+        const SelectQueryOptions & select_query_options = {});
+
+    static std::pair<SharedHeader, PlannerContextPtr> getSampleBlockAndPlannerContext(const QueryTreeNodePtr & query_tree,
         const ContextPtr & context_,
         const SelectQueryOptions & select_query_options = {});
 
@@ -59,9 +73,14 @@ public:
 
     QueryPipelineBuilder buildQueryPipeline();
 
-    void addStorageLimits(const StorageLimitsList & storage_limits);
+    /// Runs `applyDistributedPlanFallbackToLocal` on the built plan and, when the fallback
+    /// applies, propagates `make_distributed_plan = false` to the interpreter context and to
+    /// every query tree node context in place. Second-pass index analysis reads the setting
+    /// live from the contexts the plan steps captured when it builds `IN`-subquery sets. Must
+    /// run before `QueryPlanOptimizationSettings` is constructed from the context. Idempotent.
+    void applyDistributedPlanFallbackIfNeeded();
 
-    void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & /*ast*/, ContextPtr /*context*/) const override;
+    void addStorageLimits(const StorageLimitsList & storage_limits);
 
     bool supportsTransactions() const override { return true; }
 
@@ -75,12 +94,21 @@ public:
 
     const QueryTreeNodePtr & getQueryTree() const { return query_tree; }
 
+    const std::function<std::unique_ptr<QueryPlan>(const BuiltSetsByHashPtr &)> & getQueryPlanWithParallelReplicasBuilder() const
+    {
+        return query_plan_with_parallel_replicas_builder;
+    }
+
 private:
     ASTPtr query;
     ContextMutablePtr context;
     SelectQueryOptions select_query_options;
     QueryTreeNodePtr query_tree;
     Planner planner;
+
+    std::function<std::unique_ptr<QueryPlan>(const BuiltSetsByHashPtr &)> query_plan_with_parallel_replicas_builder;
 };
+
+void replaceStorageInQueryTree(QueryTreeNodePtr & query_tree, const ContextPtr & context, const StoragePtr & storage);
 
 }

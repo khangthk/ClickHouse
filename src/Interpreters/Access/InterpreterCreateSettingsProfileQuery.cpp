@@ -25,7 +25,7 @@ namespace
         SettingsProfile & profile,
         const ASTCreateSettingsProfileQuery & query,
         const String & override_name,
-        const std::optional<SettingsProfileElements> & override_settings,
+        const std::optional<AlterSettingsProfileElements> & override_settings,
         const std::optional<RolesOrUsersSet> & override_to_roles)
     {
         if (!override_name.empty())
@@ -36,9 +36,11 @@ namespace
             profile.setName(query.names.front());
 
         if (override_settings)
-            profile.elements = *override_settings;
+            profile.elements.applyChanges(*override_settings);
+        else if (query.alter_settings)
+            profile.elements.applyChanges(AlterSettingsProfileElements{*query.alter_settings});
         else if (query.settings)
-            profile.elements = *query.settings;
+            profile.elements.applyChanges(AlterSettingsProfileElements{*query.settings});
 
         if (override_to_roles)
             profile.to_roles = *override_to_roles;
@@ -54,19 +56,25 @@ BlockIO InterpreterCreateSettingsProfileQuery::execute()
     auto & query = updated_query_ptr->as<ASTCreateSettingsProfileQuery &>();
 
     auto & access_control = getContext()->getAccessControl();
-    if (query.alter)
-        getContext()->checkAccess(AccessType::ALTER_SETTINGS_PROFILE);
-    else
-        getContext()->checkAccess(AccessType::CREATE_SETTINGS_PROFILE);
 
-    std::optional<SettingsProfileElements> settings_from_query;
-    if (query.settings)
-    {
-        settings_from_query = SettingsProfileElements{*query.settings, access_control};
+    /// `CREATE SETTINGS PROFILE OR REPLACE` throws away an existing profile of the same name - including
+    /// which roles it applies to - so it is a drop followed by a create and requires the privileges of
+    /// both. `DROP SETTINGS PROFILE` is required whether or not the profile currently exists, mirroring
+    /// `REPLACE TABLE`, so that the check does not reveal which profiles exist either.
+    AccessFlags required_access = query.alter ? AccessType::ALTER_SETTINGS_PROFILE : AccessType::CREATE_SETTINGS_PROFILE;
+    if (query.or_replace)
+        required_access |= AccessType::DROP_SETTINGS_PROFILE;
 
-        if (!query.attach)
-            getContext()->checkSettingsConstraints(*settings_from_query, SettingSource::PROFILE);
-    }
+    getContext()->checkAccess(required_access);
+
+    std::optional<AlterSettingsProfileElements> settings_from_query;
+    if (query.alter_settings)
+        settings_from_query = AlterSettingsProfileElements{*query.alter_settings, access_control};
+    else if (query.settings)
+        settings_from_query = AlterSettingsProfileElements{SettingsProfileElements(*query.settings, access_control)};
+
+    if (settings_from_query && !query.attach)
+        getContext()->checkSettingsConstraints(*settings_from_query, SettingSource::PROFILE);
 
     if (!query.cluster.empty())
     {
@@ -140,6 +148,7 @@ void InterpreterCreateSettingsProfileQuery::updateSettingsProfileFromQuery(Setti
     updateSettingsProfileFromQueryImpl(SettingsProfile, query, {}, {}, {});
 }
 
+void registerInterpreterCreateSettingsProfileQuery(InterpreterFactory & factory);
 void registerInterpreterCreateSettingsProfileQuery(InterpreterFactory & factory)
 {
     auto create_fn = [] (const InterpreterFactory::Arguments & args)

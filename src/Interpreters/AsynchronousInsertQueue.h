@@ -1,21 +1,39 @@
 #pragma once
 
 #include <Core/Block.h>
-#include <Core/Settings.h>
 #include <Parsers/IAST_fwd.h>
 #include <Processors/Chunk.h>
-#include <Poco/Logger.h>
-#include <Common/CurrentThread.h>
+#include <Common/Logger.h>
 #include <Common/MemoryTrackerSwitcher.h>
 #include <Common/SettingsChanges.h>
+#include <Common/SharedMutex.h>
 #include <Common/ThreadPool.h>
+#include <Common/StringWithMemoryTracking.h>
+#include <Interpreters/AsynchronousInsertQueueDataKind.h>
+#include <Interpreters/StorageID.h>
+#include <Interpreters/Context_fwd.h>
+#include <base/defines.h>
 
 #include <future>
-#include <shared_mutex>
 #include <variant>
 
 namespace DB
 {
+
+class ThreadGroup;
+using ThreadGroupPtr = std::shared_ptr<ThreadGroup>;
+
+class AccessRightsElements;
+
+struct Settings;
+
+/// Statistics of a successfully flushed async insert entry,
+/// communicated back to the waiting client via the future.
+struct AsyncInsertProgress
+{
+    size_t rows = 0;
+    size_t bytes = 0;
+};
 
 /// A queue, that stores data for insert queries and periodically flushes it to tables.
 /// The data is grouped by table, format and settings of insert query.
@@ -23,6 +41,7 @@ class AsynchronousInsertQueue : public WithContext
 {
 public:
     using Milliseconds = std::chrono::milliseconds;
+    using ResultProgress = AsyncInsertProgress;
 
     AsynchronousInsertQueue(ContextPtr context_, size_t pool_size_, bool flush_on_shutdown_);
     ~AsynchronousInsertQueue();
@@ -38,7 +57,8 @@ public:
         Status status;
 
         /// Future that allows to wait until the query is flushed.
-        std::future<void> future{};
+        /// On success, returns the number of rows/bytes actually written.
+        std::future<ResultProgress> future{};
 
         /// Read buffer that contains extracted
         /// from query data in case of too much data.
@@ -49,59 +69,87 @@ public:
         Block insert_block{};
     };
 
-    enum class DataKind : uint8_t
-    {
-        Parsed = 0,
-        Preprocessed = 1,
-    };
-
     static void validateSettings(const Settings & settings, LoggerPtr log);
 
     /// Force flush the whole queue.
     void flushAll();
+    void flush(const std::vector<StorageID> & tables);
 
     PushResult pushQueryWithInlinedData(ASTPtr query, ContextPtr query_context);
-    PushResult pushQueryWithBlock(ASTPtr query, Block block, ContextPtr query_context);
+    PushResult pushQueryWithBlock(ASTPtr query, Block && block, ContextPtr query_context);
     size_t getPoolSize() const { return pool_size; }
 
     /// This method should be called manually because it's not flushed automatically in dtor
     /// because all tables may be already unloaded when we destroy AsynchronousInsertQueue
     void flushAndShutdown();
 
-private:
-
     struct InsertQuery
     {
     public:
         ASTPtr query;
-        String query_str;
+        /// Never log it, use `serializeQuery` on `query` instead.
+        String query_str_with_secrets;
         std::optional<UUID> user_id;
         std::vector<UUID> current_roles;
-        Settings settings;
+        /// External (pushed) roles of the originating session. Re-applied via `setUser` on the flush
+        /// context so a role that exists only as an external role is not lost or rejected with
+        /// `SET_NON_GRANTED_ROLE`. It is not part of the batching key: `current_roles` above holds the
+        /// session's *effective* roles (which already include these), so inserts whose effective role
+        /// set differs are already never coalesced, and equal effective sets carry identical privileges.
+        std::vector<UUID> external_roles;
+        /// Credential grant limit of the originating session (null if the session is not limited).
+        /// Replayed on the flush context so the deferred insert keeps the token intersection instead of
+        /// regaining the full user's rights. Part of the batching key (folded into `hash`) so inserts
+        /// with different credential limits are never coalesced into one flush.
+        std::shared_ptr<const AccessRightsElements> authentication_grants;
+        /// Expiry (VALID UNTIL) of the originating session's authentication method, 0 if none. Carried
+        /// over so the deferred flush fails closed if the credential has expired between enqueue and
+        /// flush. Part of the batching key (folded into `hash` and compared in `toTupleCmp`) so inserts
+        /// made under credentials with different expiries are never coalesced into one flush.
+        time_t authentication_valid_until = 0;
+        /// Client identity of the originating INSERT query (ClientInfo user names).
+        /// Restored on the flush context so currentUser()/user()/authenticatedUser() and
+        /// the materialized views triggered by the flush observe the inserting user instead
+        /// of an empty string. Part of the batching key so inserts from different identities
+        /// (e.g. impersonation, forwarded distributed queries) are never coalesced.
+        String current_user;
+        String initial_user;
+        String authenticated_user;
+        std::unique_ptr<Settings> settings;
 
-        DataKind data_kind;
-        UInt128 hash;
+        AsynchronousInsertQueueDataKind data_kind;
+        UInt128 hash{};
 
         InsertQuery(
             const ASTPtr & query_,
             const std::optional<UUID> & user_id_,
             const std::vector<UUID> & current_roles_,
+            const std::vector<UUID> & external_roles_,
+            const std::shared_ptr<const AccessRightsElements> & authentication_grants_,
+            time_t authentication_valid_until_,
+            const String & current_user_,
+            const String & initial_user_,
+            const String & authenticated_user_,
             const Settings & settings_,
-            DataKind data_kind_);
+            AsynchronousInsertQueueDataKind data_kind_);
 
-        InsertQuery(const InsertQuery & other) { *this = other; }
+        InsertQuery(const InsertQuery & other);
         InsertQuery & operator=(const InsertQuery & other);
         bool operator==(const InsertQuery & other) const;
+        StorageID getStorageID() const;
 
     private:
-        auto toTupleCmp() const { return std::tie(data_kind, query_str, user_id, current_roles, setting_changes); }
+        /// `authentication_grants` is compared by content in `operator==` (a shared_ptr would compare
+        /// identity, which is inconsistent with the content-based hash), so it is not part of this tuple.
+        auto toTupleCmp() const { return std::tie(data_kind, query_str_with_secrets, user_id, current_roles, authentication_valid_until, current_user, initial_user, authenticated_user, setting_changes); }
 
         std::vector<SettingChange> setting_changes;
     };
 
-    struct DataChunk : public std::variant<String, Block>
+private:
+    struct DataChunk : public std::variant<StringWithMemoryTracking, Block>
     {
-        using std::variant<String, Block>::variant;
+        using std::variant<StringWithMemoryTracking, Block>::variant;
 
         size_t byteSize() const
         {
@@ -114,12 +162,11 @@ private:
             }, *this);
         }
 
-        DataKind getDataKind() const
+        AsynchronousInsertQueueDataKind getDataKind() const
         {
             if (std::holds_alternative<Block>(*this))
-                return DataKind::Preprocessed;
-            else
-                return DataKind::Parsed;
+                return AsynchronousInsertQueueDataKind::Preprocessed;
+            return AsynchronousInsertQueueDataKind::Parsed;
         }
 
         bool empty() const
@@ -133,7 +180,7 @@ private:
             }, *this);
         }
 
-        const String * asString() const { return std::get_if<String>(this); }
+        const StringWithMemoryTracking * asString() const { return std::get_if<StringWithMemoryTracking>(this); }
         const Block * asBlock() const { return std::get_if<Block>(this); }
     };
 
@@ -158,18 +205,25 @@ private:
                 MemoryTracker * user_memory_tracker_);
 
             void resetChunk();
-            void finish(std::exception_ptr exception_ = nullptr);
+            void finish(ResultProgress result = {});
+            void finish(std::exception_ptr exception_);
 
-            std::future<void> getFuture() { return promise.get_future(); }
+            std::future<ResultProgress> getFuture() { return promise.get_future(); }
             bool isFinished() const { return finished; }
 
         private:
-            std::promise<void> promise;
+            std::promise<ResultProgress> promise;
             std::atomic_bool finished = false;
         };
 
-        InsertData() = default;
-        explicit InsertData(Milliseconds timeout_ms_) : timeout_ms(timeout_ms_) { }
+        InsertData()
+            : ready_future(ready_promise.get_future().share())
+        { }
+
+        explicit InsertData(Milliseconds timeout_ms_)
+            : ready_future(ready_promise.get_future().share())
+            , timeout_ms(timeout_ms_)
+        { }
 
         ~InsertData()
         {
@@ -182,11 +236,15 @@ private:
                 MemoryTrackerSwitcher switcher((*it)->user_memory_tracker);
                 it = entries.erase(it);
             }
+
+            ready_promise.set_value();
         }
 
         using EntryPtr = std::shared_ptr<Entry>;
 
         std::list<EntryPtr> entries;
+        std::promise<void>  ready_promise;
+        std::shared_future<void> ready_future;
         size_t size_in_bytes = 0;
         Milliseconds timeout_ms = Milliseconds::zero();
     };
@@ -202,7 +260,8 @@ private:
     /// Ordered container
     /// Key is a timestamp of the first insert into batch.
     /// Used to detect for how long the batch is active, so we can dump it by timer.
-    using Queue = std::map<std::chrono::steady_clock::time_point, Container>;
+    /// Must be a multimap: two queries with different keys may theoretically compute the same deadline.
+    using Queue = std::multimap<std::chrono::steady_clock::time_point, Container>;
     using QueueIterator = Queue::iterator;
     using QueueIteratorByKey = std::unordered_map<UInt128, QueueIterator>;
 
@@ -213,11 +272,11 @@ private:
         mutable std::mutex mutex;
         mutable std::condition_variable are_tasks_available;
 
-        Queue queue;
-        QueueIteratorByKey iterators;
+        Queue queue TSA_GUARDED_BY(mutex);
+        QueueIteratorByKey iterators TSA_GUARDED_BY(mutex);
 
-        OptionalTimePoint last_insert_time;
-        std::chrono::milliseconds busy_timeout_ms;
+        OptionalTimePoint last_insert_time TSA_GUARDED_BY(mutex);
+        std::chrono::milliseconds busy_timeout_ms TSA_GUARDED_BY(mutex) {};
     };
 
     /// Times of the two most recent queue flushes.
@@ -230,7 +289,7 @@ private:
         void updateWithCurrentTime();
 
     private:
-        mutable std::shared_mutex mutex;
+        mutable SharedMutex mutex;
         TimePoints time_points;
     };
 
@@ -262,21 +321,21 @@ private:
 
     LoggerPtr log = getLogger("AsynchronousInsertQueue");
 
-    PushResult pushDataChunk(ASTPtr query, DataChunk chunk, ContextPtr query_context);
+    PushResult pushDataChunk(ASTPtr query, DataChunk && chunk, ContextPtr query_context);
 
     Milliseconds getBusyWaitTimeoutMs(
         const Settings & settings,
         const QueueShard & shard,
         const QueueShardFlushTimeHistory::TimePoints & flush_time_points,
-        std::chrono::steady_clock::time_point now) const;
+        std::chrono::steady_clock::time_point now) const TSA_REQUIRES(shard.mutex);
 
     void preprocessInsertQuery(const ASTPtr & query, const ContextPtr & query_context);
 
     void processBatchDeadlines(size_t shard_num);
-    void scheduleDataProcessingJob(const InsertQuery & key, InsertDataPtr data, ContextPtr global_context, size_t shard_num);
+    void scheduleDataProcessingJob(const InsertQuery & key, InsertDataPtr data, ContextPtr global_context, size_t shard_num, ThreadGroupPtr current_query_thread_group = nullptr);
 
     static void processData(
-        InsertQuery key, InsertDataPtr data, ContextPtr global_context, QueueShardFlushTimeHistory & queue_shard_flush_time_history);
+        InsertQuery key, InsertDataPtr data, ContextPtr global_context, ThreadGroupPtr current_query_thread_group, QueueShardFlushTimeHistory & queue_shard_flush_time_history);
 
     template <typename LogFunc>
     static Chunk processEntriesWithParsing(
@@ -291,13 +350,19 @@ private:
     static Chunk processPreprocessedEntries(
         const InsertDataPtr & data,
         const Block & header,
+        const ContextPtr & context_,
+        LoggerPtr logger,
         LogFunc && add_to_async_insert_log);
 
     template <typename E>
     static void finishWithException(const ASTPtr & query, const std::list<InsertData::EntryPtr> & entries, const E & exception);
 
+    static std::vector<std::string> getInsertQueryIds(InsertData & data);
+
+    void clear();
+
 public:
-    auto getQueueLocked(size_t shard_num) const
+    auto getQueueLocked(size_t shard_num) const TSA_NO_THREAD_SAFETY_ANALYSIS
     {
         const auto & shard = queue_shards[shard_num];
         std::unique_lock lock(shard.mutex);

@@ -14,8 +14,10 @@
 #include <Common/CurrentMetrics.h>
 #include <Common/Priority.h>
 #include <Common/Stopwatch.h>
+#include <Common/setThreadName.h>
 #include <Common/ThreadPool_fwd.h>
 #include <Common/Logger.h>
+#include <Common/AsyncLoader_fwd.h>
 
 
 namespace Poco { class Logger; }
@@ -367,8 +369,11 @@ private:
         const Priority priority;
         std::map<UInt64, LoadJobPtr> ready_queue; // FIFO queue of jobs to be executed in this pool. Map is used for faster erasing. Key is `ready_seqno`
         size_t max_threads; // Max number of workers to be spawn
-        size_t workers = 0; // Number of currently executing workers
+        size_t workers = 0; // Number of submitted workers, including the ones still queued in the global thread pool
         std::atomic<size_t> suspended_workers{0}; // Number of workers that are blocked by `wait()` call on a job executing in the same pool (for deadlock resolution)
+        std::atomic<size_t> waiting_workers{0}; // Number of workers of this pool that are inside a `wait()` call, on a job of any pool. Superset of `suspended_workers`
+        size_t started_workers = 0; // Number of workers that entered `worker()`. Unlike `workers`, this excludes the ones still queued in the global thread pool
+        bool spawn_failed = false; // Set while the global thread pool is known to have no thread available for this pool
         std::unique_ptr<ThreadPool> thread_pool; // NOTE: we avoid using a `ThreadPool` queue to be able to move jobs between pools.
 
         explicit Pool(const PoolInitializer & init);
@@ -395,17 +400,20 @@ public:
     // WARNING: all tasks instances should be destructed before associated AsyncLoader.
     ~AsyncLoader();
 
-    // Start workers to execute scheduled load jobs. Note that AsyncLoader is constructed as already started.
-    void start();
-
     // Wait for all load jobs to finish, including all new jobs. So at first take care to stop adding new jobs.
     void wait();
 
+    // Wait for currently executing jobs to finish, cancel pending jobs with an exception,
+    // prevent scheduling of new jobs.
+    void shutdown();
+
     // Wait for currently executing jobs to finish, but do not run any other pending jobs.
     // Not finished jobs are left in pending state:
-    //  - they can be executed by calling start() again;
+    //  - they can be executed by calling unpause() again;
     //  - or canceled using ~Task() or remove() later.
-    void stop();
+    // Currently only used in tests.
+    void pause();
+    void unpause();
 
     // Schedule all jobs of given `task` and their dependencies (even if they are not in task).
     // All dependencies of a scheduled job inherit its pool if it has higher priority. This way higher priority job
@@ -429,7 +437,8 @@ public:
     // Waiting for a not scheduled job is considered to be LOGICAL_ERROR, use waitLoad() helper instead to make sure the job is scheduled.
     // There are more rules if `wait()` is called from another job:
     //  1) waiting on a dependent job is considered to be LOGICAL_ERROR;
-    //  2) waiting on a job in the same pool might lead to more workers spawned in that pool to resolve "blocked pool" deadlock;
+    //  2) waiting stops this worker from draining its own pool's queue, so it might lead to more workers
+    //     spawned in that pool; in the same-pool case that also resolves the "blocked pool" deadlock;
     //  3) waiting on a job with lower priority lead to priority inheritance to avoid priority inversion.
     void wait(const LoadJobPtr & job, bool no_throw = false);
 
@@ -472,7 +481,9 @@ private:
     bool canWorkerLive(Pool & pool, std::unique_lock<std::mutex> & lock);
     void setCurrentPriority(std::unique_lock<std::mutex> & lock, std::optional<Priority> priority);
     void updateCurrentPriorityAndSpawn(std::unique_lock<std::mutex> & lock);
-    void spawn(Pool & pool, std::unique_lock<std::mutex> & lock);
+    // Returns false if no worker was spawned, which is only allowed while the pool keeps a worker that
+    // drains its ready queue: one that is running, or one resuming from a wait on another pool.
+    bool spawn(Pool & pool, std::unique_lock<std::mutex> & lock);
     void worker(Pool & pool);
     bool hasWorker(std::unique_lock<std::mutex> & lock) const;
 
@@ -484,6 +495,7 @@ private:
 
     mutable std::mutex mutex; // Guards all the fields below.
     bool is_running = true;
+    bool shutdown_requested = false;
     std::optional<Priority> current_priority; // highest priority among active pools
     UInt64 last_ready_seqno = 0; // Increasing counter for ready queue keys.
     UInt64 last_job_id = 0; // Increasing counter for job IDs

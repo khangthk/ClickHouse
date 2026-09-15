@@ -4,15 +4,39 @@
 
 #if USE_AWS_S3
 #include <Backups/BackupIO_Default.h>
-#include <Common/Logger.h>
 #include <Disks/DiskType.h>
+#include <Disks/IDisk.h>
 #include <IO/S3Common.h>
 #include <IO/S3Settings.h>
 #include <Interpreters/Context_fwd.h>
-#include <IO/S3/BlobStorageLogWriter.h>
+#include <Common/BlobStorageLogWriter.h>
+#include <IO/S3/S3Capabilities.h>
+
+#include <functional>
+
 
 namespace DB
 {
+
+class S3BackupDiskClientFactory
+{
+public:
+    struct Entry
+    {
+        std::shared_ptr<S3::Client> backup_client;
+        std::weak_ptr<const S3::Client> disk_reported_client;
+    };
+    using CreateFn = std::function<Entry(DiskPtr)>;
+    explicit S3BackupDiskClientFactory(const CreateFn & create_fn_);
+    std::shared_ptr<S3::Client> getOrCreate(DiskPtr disk);
+
+private:
+    const CreateFn create_fn;
+
+    mutable std::mutex clients_mutex;
+    /// Disk name to client entry;
+    std::unordered_map<std::string, Entry> clients TSA_GUARDED_BY(clients_mutex);
+};
 
 /// Represents a backup stored to AWS S3.
 class BackupReaderS3 : public BackupReaderDefault
@@ -22,6 +46,10 @@ public:
         const S3::URI & s3_uri_,
         const String & access_key_id_,
         const String & secret_access_key_,
+        const String & role_arn,
+        const String & role_session_name,
+        const String & external_id,
+        const std::optional<S3::S3AuthSettings> & named_collection_auth,
         bool allow_s3_native_copy,
         const ReadSettings & read_settings_,
         const WriteSettings & write_settings_,
@@ -31,16 +59,49 @@ public:
 
     bool fileExists(const String & file_name) override;
     UInt64 getFileSize(const String & file_name) override;
-    std::unique_ptr<SeekableReadBuffer> readFile(const String & file_name) override;
+    std::unique_ptr<ReadBufferFromFileBase> readFile(const String & file_name, std::optional<size_t> expected_file_size) override;
+
+    String getFileGeneration(const String & file_name) override;
+    std::unique_ptr<ReadBufferFromFileBase> readFilePinnedToGeneration(
+        const String & file_name, std::optional<size_t> expected_file_size, const String & generation) override;
 
     void copyFileToDisk(const String & path_in_backup, size_t file_size, bool encrypted_in_backup,
                         DiskPtr destination_disk, const String & destination_path, WriteMode write_mode) override;
 
+    /// Overridden to use the native ranged server-side copy (copyS3FileRange) instead of buffers.
+    void copyFileRangeToDisk(const String & path_in_backup, size_t offset, size_t size, size_t file_size,
+                             bool encrypted_in_backup, DiskPtr destination_disk, const String & destination_path,
+                             WriteMode write_mode) override;
+
+    std::map<String, String> getSerializedSettings() const override;
+
 private:
+    struct CheckedBackupFile
+    {
+        /// The `ETag` every request of the read is pinned to, or empty for an unpinned read.
+        String generation;
+        /// The size of the object, when one `HeadObject` measured it.
+        std::optional<size_t> size;
+    };
+
+    /// One `HeadObject` of a file of the backup, when a read of it needs one: checks the size the
+    /// backup metadata records against the object (a longer replacement would otherwise be restored
+    /// as its first bytes, or copied whole), checks a generation named by the caller, and names the
+    /// generation a plain read is pinned to. Throws `S3_OBJECT_CHANGED_DURING_READ` on a mismatch.
+    CheckedBackupFile checkBackupFile(const String & file_name, std::optional<size_t> expected_file_size, const String & generation) const;
+
+    void copyToDiskImpl(const String & path_in_backup, size_t offset, size_t size, size_t file_size, bool is_range,
+                        bool encrypted_in_backup, DiskPtr destination_disk, const String & destination_path,
+                        WriteMode write_mode);
+
     const S3::URI s3_uri;
     const DataSourceDescription data_source_description;
     S3Settings s3_settings;
     std::shared_ptr<S3::Client> client;
+
+    /// `s3_validate_etag_on_read` at the time the backup was opened: whether an ordinary read of a
+    /// file of an unversioned backup is pinned to the generation one `HeadObject` names for it.
+    const bool pin_plain_reads_to_generation;
 
     BlobStorageLogWriterPtr blob_storage_log;
 };
@@ -53,6 +114,10 @@ public:
         const S3::URI & s3_uri_,
         const String & access_key_id_,
         const String & secret_access_key_,
+        const String & role_arn,
+        const String & role_session_name,
+        const String & external_id,
+        const std::optional<S3::S3AuthSettings> & named_collection_auth,
         bool allow_s3_native_copy,
         const String & storage_class_name,
         const ReadSettings & read_settings_,
@@ -64,26 +129,32 @@ public:
     bool fileExists(const String & file_name) override;
     UInt64 getFileSize(const String & file_name) override;
     std::unique_ptr<WriteBuffer> writeFile(const String & file_name) override;
+    std::unique_ptr<WriteBuffer> writeFileIfNotExists(const String & file_name) override;
 
     void copyDataToFile(const String & path_in_backup, const CreateReadBufferFunction & create_read_buffer, UInt64 start_pos, UInt64 length) override;
-    void copyFileFromDisk(const String & path_in_backup, DiskPtr src_disk, const String & src_path,
-                          bool copy_encrypted, UInt64 start_pos, UInt64 length) override;
+    void copyFileFromDisk(
+        const String & path_in_backup, DiskPtr src_disk, const String & src_path, bool copy_encrypted, UInt64 start_pos, UInt64 length)
+        override;
 
     void copyFile(const String & destination, const String & source, size_t size) override;
 
     void removeFile(const String & file_name) override;
     void removeFiles(const Strings & file_names) override;
 
+    std::map<String, String> getSerializedSettings() const override;
+
 private:
     std::unique_ptr<ReadBuffer> readFile(const String & file_name, size_t expected_file_size) override;
-    void removeFilesBatch(const Strings & file_names);
 
     const S3::URI s3_uri;
     const DataSourceDescription data_source_description;
+    /// `s3_validate_etag_on_read` at the time the backup was opened: whether the S3-to-S3 copies of
+    /// this writer are pinned to one generation of their source (see `copyFileFromDisk`).
+    const bool pin_copies_to_generation;
     S3Settings s3_settings;
     std::shared_ptr<S3::Client> client;
-    std::optional<bool> supports_batch_delete;
-
+    S3Capabilities s3_capabilities;
+    S3BackupDiskClientFactory disk_client_factory;
     BlobStorageLogWriterPtr blob_storage_log;
 };
 

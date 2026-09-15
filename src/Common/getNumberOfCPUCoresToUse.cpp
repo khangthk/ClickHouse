@@ -1,4 +1,4 @@
-#include "getNumberOfCPUCoresToUse.h"
+#include <Common/getNumberOfCPUCoresToUse.h>
 
 #if defined(OS_LINUX)
 #    include <cmath>
@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <thread>
 #include <set>
+#include <vector>
 
 namespace
 {
@@ -23,11 +24,10 @@ int32_t readFrom(const std::filesystem::path & filename, int default_value)
     std::ifstream infile(filename);
     if (!infile.is_open())
         return default_value;
-    int idata;
+    int idata = 0;
     if (infile >> idata)
         return idata;
-    else
-        return default_value;
+    return default_value;
 }
 
 /// Try to look at cgroups limit if it is available.
@@ -52,7 +52,7 @@ uint32_t getCGroupLimitedCPUCores(unsigned default_cpu_count)
             if (cpu_max_file.is_open())
             {
                 std::string cpu_limit_str;
-                float cpu_period;
+                float cpu_period = 0;
                 cpu_max_file >> cpu_limit_str >> cpu_period;
                 if (cpu_limit_str != "max" && cpu_period != 0)
                 {
@@ -144,13 +144,13 @@ try
         std::string key = line.substr(0, pos);
         std::string val = line.substr(pos + 1);
 
-        if (key.find("physical id") != std::string::npos)
+        if (key.contains("physical id"))
         {
             cur_core_entry.first = std::stoi(val);
             continue;
         }
 
-        if (key.find("core id") != std::string::npos)
+        if (key.contains("core id"))
         {
             cur_core_entry.second = std::stoi(val);
             core_entries.insert(cur_core_entry);
@@ -159,7 +159,7 @@ try
     }
     return core_entries.empty() ? /*unexpected format*/ std::thread::hardware_concurrency() : static_cast<unsigned>(core_entries.size());
 }
-catch (...)
+catch (const std::exception &)
 {
     return std::thread::hardware_concurrency(); /// parsing error
 }
@@ -176,7 +176,7 @@ unsigned getNumberOfCPUCoresToUseImpl()
     ///
     /// On really big machines, SMT is detrimental to performance (+ ~5% overhead in ClickBench). On such machines, we limit ourself to the physical cores.
     /// Few cores indicate it is a small machine, runs in a VM or is a limited cloud instance --> it is reasonable to use all the cores.
-    if (cores >= 32)
+    if (cores >= 64)
         cores = physical_concurrency();
 #endif
 

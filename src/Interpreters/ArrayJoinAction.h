@@ -1,15 +1,18 @@
 #pragma once
 
-#include <Core/Names.h>
 #include <Core/Block.h>
-#include <Interpreters/Context_fwd.h>
+#include <Core/Names.h>
 
+#include <map>
 
 namespace DB
 {
 
 class IFunctionOverloadResolver;
 using FunctionOverloadResolverPtr = std::shared_ptr<IFunctionOverloadResolver>;
+
+class ExpressionActions;
+using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
 
 class DataTypeArray;
 class ColumnArray;
@@ -30,6 +33,7 @@ public:
     bool is_left = false;
     bool is_unaligned = false;
     size_t max_block_size = DEFAULT_BLOCK_SIZE;
+    bool enable_lazy_columns_replication = false;
 
     /// For unaligned [LEFT] ARRAY JOIN
     FunctionOverloadResolverPtr function_length;
@@ -38,7 +42,11 @@ public:
     /// For LEFT ARRAY JOIN.
     FunctionOverloadResolverPtr function_builder;
 
-    ArrayJoinAction(const Names & columns_, bool is_left_, bool is_unaligned_, size_t max_block_size_);
+    /// Optional element-space filter: drops elements before expansion so they're never replicated
+    ExpressionActionsPtr element_filter;
+    String element_filter_column_name;
+
+    ArrayJoinAction(const Names & columns_, bool is_left_, bool is_unaligned_, size_t max_block_size_, bool enable_lazy_columns_replication_);
     static void prepare(const NameSet & columns, ColumnsWithTypeAndName & sample);
     static void prepare(const Names & columns, ColumnsWithTypeAndName & sample);
 
@@ -50,15 +58,20 @@ using ArrayJoinActionPtr = std::shared_ptr<ArrayJoinAction>;
 class ArrayJoinResultIterator
 {
 public:
-    explicit ArrayJoinResultIterator(const ArrayJoinAction * array_join_, Block block_);
+    explicit ArrayJoinResultIterator(const ArrayJoinAction * array_join_, Block block_, bool enable_lazy_columns_replication_);
     ~ArrayJoinResultIterator() = default;
 
     Block next();
     bool hasNext() const;
 
 private:
+    /// Element-space filtered variant of next(): runs the element filter over one window (row columns
+    /// it reads are broadcast to the elements) and expands only the survivors.
+    Block nextWithElementFilter();
+
     const ArrayJoinAction * array_join;
     Block block;
+    bool enable_lazy_columns_replication;
 
     ColumnPtr any_array_map_ptr;
     const ColumnArray * any_array;

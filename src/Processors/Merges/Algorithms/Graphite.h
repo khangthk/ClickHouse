@@ -3,7 +3,6 @@
 #include <AggregateFunctions/IAggregateFunction_fwd.h>
 #include <Interpreters/Context_fwd.h>
 #include <Common/OptimizedRegularExpression.h>
-#include <Common/SipHash.h>
 
 /** Intended for implementation of "rollup" - aggregation (rounding) of older data
   *  for a table with Graphite data (Graphite is the system for time series monitoring).
@@ -90,6 +89,9 @@
   *     </default>
   * </graphite_rollup>
   */
+
+class SipHash;
+
 namespace DB::Graphite
 {
 
@@ -99,10 +101,11 @@ enum RuleType
     RuleTypeAll = 0,        // default, with regex, compatible with old scheme
     RuleTypePlain = 1,      // plain metrics, with regex, compatible with old scheme
     RuleTypeTagged = 2,     // tagged metrics, with regex, compatible with old scheme
-    RuleTypeTagList = 3     // tagged metrics, with regex (converted to  RuleTypeTagged from string like 'retention=10min ; env=(staging|prod)')
+    RuleTypeTagList = 3     // tagged metrics, with regex (converted to RuleTypeTagged from string like 'retention=10min ; env=(staging|prod)')
 };
 
 const String & ruleTypeStr(RuleType rule_type);
+std::string buildTaggedRegex(std::string regexp_str);
 
 struct Retention
 {
@@ -141,26 +144,14 @@ struct Params
     String time_column_name;
     String value_column_name;
     String version_column_name;
-    bool patterns_typed;
+    bool patterns_typed{};
     Graphite::Patterns patterns;
     Graphite::Patterns patterns_plain;
     Graphite::Patterns patterns_tagged;
-    void updateHash(SipHash & hash) const
-    {
-        hash.update(path_column_name);
-        hash.update(time_column_name);
-        hash.update(value_column_name);
-        hash.update(value_column_name);
-        hash.update(version_column_name);
-        hash.update(patterns_typed);
-        for (const auto & p : patterns)
-            p.updateHash(hash);
-        for (const auto & p : patterns_plain)
-            p.updateHash(hash);
-        for (const auto & p : patterns_tagged)
-            p.updateHash(hash);
-    }
+    void updateHash(SipHash & hash) const;
 };
+
+bool operator==(const Params & a, const Params & b);
 
 using RollupRule = std::pair<const RetentionPattern *, const AggregationPattern *>;
 

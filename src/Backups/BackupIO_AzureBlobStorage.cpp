@@ -1,7 +1,7 @@
 #include <Backups/BackupIO_AzureBlobStorage.h>
+#include <Common/setThreadName.h>
 
 #if USE_AZURE_BLOB_STORAGE
-#include <Common/quoteString.h>
 #include <Common/threadPoolCallbackRunner.h>
 #include <Interpreters/Context.h>
 #include <IO/SharedThreadPools.h>
@@ -14,6 +14,7 @@
 
 #include <Poco/Util/AbstractConfiguration.h>
 #include <azure/storage/blobs/blob_options.hpp>
+#include <azure/core/context.hpp>
 
 #include <filesystem>
 
@@ -22,10 +23,121 @@ namespace fs = std::filesystem;
 
 namespace DB
 {
+
 namespace ErrorCodes
 {
-    extern const int AZURE_BLOB_STORAGE_ERROR;
     extern const int LOGICAL_ERROR;
+    extern const int BACKUP_DAMAGED;
+    extern const int FILE_CHANGED_DURING_READ;
+    extern const int AZURE_BLOB_STORAGE_ERROR;
+}
+
+namespace
+{
+    /// Every read and every copy of a backup is pinned to the generation (`ETag`) of the blob a
+    /// `HEAD` selected. A generation that cannot be learned cannot be pinned to: a blob overwritten
+    /// between that `HEAD` and the read or the copy would then be taken for the one selected, and
+    /// the size alone does not tell two generations apart. Backups do not degrade to that silently:
+    /// an endpoint that reports no `ETag` for a blob is refused.
+    void requireBlobGeneration(const String & blob_path, const ObjectMetadata & metadata)
+    {
+        if (metadata.etag.empty())
+            throw Exception(ErrorCodes::AZURE_BLOB_STORAGE_ERROR,
+                "The endpoint reports no `ETag` for blob {}, so a read or a copy of the blob cannot be pinned "
+                "to one generation of it. Backups require the generation of every blob they read or copy",
+                blob_path);
+    }
+}
+
+String headSourceBlobOfBackupCopy(const IObjectStorage & src_object_storage, const String & blob_path, size_t expected_size)
+{
+    const ObjectMetadata metadata = src_object_storage.getObjectMetadata(blob_path, /*with_tags=*/ false);
+    if (metadata.size_bytes != expected_size)
+        throw Exception(ErrorCodes::FILE_CHANGED_DURING_READ,
+            "Blob {} is {} bytes long, while the file being backed up is {} bytes long: "
+            "the blob was replaced after the size of the file was taken",
+            blob_path, metadata.size_bytes, expected_size);
+    requireBlobGeneration(blob_path, metadata);
+    return metadata.etag;
+}
+
+std::unique_ptr<ReadBufferFromFileBase> readSourceBlobOfBackupCopy(
+    std::shared_ptr<const AzureBlobStorage::ContainerClient> client,
+    const String & container,
+    const String & blob_path,
+    size_t source_size,
+    const String & etag,
+    const ReadSettings & read_settings,
+    const AzureBlobStorage::RequestSettings & request_settings)
+{
+    return std::make_unique<ReadBufferFromAzureBlobStorage>(
+        std::move(client), blob_path, read_settings,
+        request_settings.max_single_read_retries,
+        request_settings.max_single_download_retries,
+        /* use_external_buffer */ false,
+        /* restricted_seek */ false,
+        /* read_until_position */ 0,
+        /* blob_storage_log */ nullptr,
+        container,
+        /* known_object_size */ source_size,
+        /* expected_etag */ etag);
+}
+
+namespace
+{
+    /// The size and the generation (`ETag`) of a blob of the backup, taken with one `HEAD` before it is
+    /// read or copied. Every read and every copy of a backup blob is pinned to that generation, so a
+    /// blob overwritten while the backup is in use is reported as `FILE_CHANGED_DURING_READ` rather
+    /// than restored as a mix of two generations or as a same-size wrong one, and the size is the
+    /// end-of-file bound of a read, so the endpoint cannot move it by misreporting a length.
+    /// A blob whose generation the endpoint does not report is refused (see `requireBlobGeneration`).
+    ObjectMetadata headBackupBlob(const AzureObjectStorage & object_storage, const String & key)
+    {
+        ObjectMetadata metadata = object_storage.getObjectMetadata(key, /*with_tags=*/ false);
+        requireBlobGeneration(key, metadata);
+        return metadata;
+    }
+
+    /// A copy of a backup blob is given the size the backup metadata recorded for it, which is also
+    /// the size the destination is told. A blob of another size is not the blob the backup wrote.
+    void checkBackupBlobSize(const String & key, const ObjectMetadata & metadata, size_t expected_size)
+    {
+        if (metadata.size_bytes != expected_size)
+            throw Exception(ErrorCodes::BACKUP_DAMAGED,
+                "Blob {} of the backup is {} bytes long, while the backup metadata says {}",
+                key, metadata.size_bytes, expected_size);
+    }
+
+    std::map<String, String> serializeAzureRequestSettings(
+        const AzureBlobStorage::RequestSettings & settings, const ReadSettings & read_settings)
+    {
+        /// Only settings that backup Azure IO actually consumes are reported. Disk/list-only fields
+        /// (read_only, list_object_keys_size) are intentionally omitted, as are the http_keep_alive_*
+        /// fields (which come from server settings, not RequestSettings), so the map is not misleading
+        /// about what the backup engine effectively uses.
+        return {
+            {"use_native_copy", settings.use_native_copy ? "1" : "0"},
+            {"check_objects_after_upload", settings.check_objects_after_upload ? "1" : "0"},
+            {"max_single_part_upload_size", std::to_string(settings.max_single_part_upload_size)},
+            /// Backup reads use ReadBufferFromAzureBlobStorage, whose seek coalescing uses the read
+            /// setting (remote_read_min_bytes_for_seek), not RequestSettings::min_bytes_for_seek.
+            {"min_bytes_for_seek", std::to_string(read_settings.remote_fs_settings.min_bytes_for_seek)},
+            {"max_single_read_retries", std::to_string(settings.max_single_read_retries)},
+            {"max_single_download_retries", std::to_string(settings.max_single_download_retries)},
+            {"min_upload_part_size", std::to_string(settings.min_upload_part_size)},
+            {"max_upload_part_size", std::to_string(settings.max_upload_part_size)},
+            {"max_single_part_copy_size", std::to_string(settings.max_single_part_copy_size)},
+            {"max_unexpected_write_error_retries", std::to_string(settings.max_unexpected_write_error_retries)},
+            {"max_inflight_parts_for_one_file", std::to_string(settings.max_inflight_parts_for_one_file)},
+            {"max_blocks_in_multipart_upload", std::to_string(settings.max_blocks_in_multipart_upload)},
+            {"strict_upload_part_size", std::to_string(settings.strict_upload_part_size)},
+            {"upload_part_size_multiply_factor", std::to_string(settings.upload_part_size_multiply_factor)},
+            {"upload_part_size_multiply_parts_count_threshold", std::to_string(settings.upload_part_size_multiply_parts_count_threshold)},
+            {"sdk_max_retries", std::to_string(settings.sdk_max_retries)},
+            {"sdk_retry_initial_backoff_ms", std::to_string(settings.sdk_retry_initial_backoff_ms)},
+            {"sdk_retry_max_backoff_ms", std::to_string(settings.sdk_retry_max_backoff_ms)},
+        };
+    }
 }
 
 BackupReaderAzureBlobStorage::BackupReaderAzureBlobStorage(
@@ -36,25 +148,33 @@ BackupReaderAzureBlobStorage::BackupReaderAzureBlobStorage(
     const WriteSettings & write_settings_,
     const ContextPtr & context_)
     : BackupReaderDefault(read_settings_, write_settings_, getLogger("BackupReaderAzureBlobStorage"))
-    , data_source_description{DataSourceType::ObjectStorage, ObjectStorageType::Azure, MetadataStorageType::None, connection_params_.getConnectionURL(), false, false}
+    , data_source_description{DataSourceType::ObjectStorage, ObjectStorageType::Azure, MetadataStorageType::None, connection_params_.getConnectionURL(), false, false, ""}
     , connection_params(connection_params_)
     , blob_path(blob_path_)
 {
     auto client_ptr = AzureBlobStorage::getContainerClient(connection_params, /*readonly=*/ false);
-    auto settings_ptr = AzureBlobStorage::getRequestSettingsForBackup(context_->getSettingsRef(), allow_azure_native_copy);
+    auto settings_ptr = AzureBlobStorage::getRequestSettingsForBackup(context_, connection_params.endpoint.storage_account_url, allow_azure_native_copy);
 
     object_storage = std::make_unique<AzureObjectStorage>(
         "BackupReaderAzureBlobStorage",
+        connection_params.auth_method,
         std::move(client_ptr),
         std::move(settings_ptr),
+        connection_params,
         connection_params.getContainer(),
-        connection_params.getConnectionURL());
+        connection_params.getConnectionURL(),
+        /*common_key_prefix*/ "");
 
     client = object_storage->getAzureBlobStorageClient();
     settings = object_storage->getSettings();
 }
 
 BackupReaderAzureBlobStorage::~BackupReaderAzureBlobStorage() = default;
+
+std::map<String, String> BackupReaderAzureBlobStorage::getSerializedSettings() const
+{
+    return serializeAzureRequestSettings(*settings, read_settings);
+}
 
 bool BackupReaderAzureBlobStorage::fileExists(const String & file_name)
 {
@@ -65,16 +185,67 @@ bool BackupReaderAzureBlobStorage::fileExists(const String & file_name)
 UInt64 BackupReaderAzureBlobStorage::getFileSize(const String & file_name)
 {
     String key = fs::path(blob_path) / file_name;
-    ObjectMetadata object_metadata = object_storage->getObjectMetadata(key);
+    ObjectMetadata object_metadata = object_storage->getObjectMetadata(key, /*with_tags=*/ false);
     return object_metadata.size_bytes;
 }
 
-std::unique_ptr<SeekableReadBuffer> BackupReaderAzureBlobStorage::readFile(const String & file_name)
+String BackupReaderAzureBlobStorage::getFileGeneration(const String & file_name)
 {
     String key = fs::path(blob_path) / file_name;
+    String generation = headBackupBlob(*object_storage, key).etag;
+
+    /// The caller reads this blob through more than one buffer (an archive, reopened for every
+    /// handle) and needs every one of them to land on the same generation. An empty token would
+    /// pin none of them, and a blob replaced in place between two handles would be read as two
+    /// archives, so the blob is refused up front, before the first handle is opened.
+    if (generation.empty())
+        throw Exception(
+            ErrorCodes::AZURE_BLOB_STORAGE_ERROR,
+            "Blob {} of the backup cannot be read: the endpoint reports no `ETag` for it, so the reads of the "
+            "backup cannot be pinned to one generation of the blob",
+            key);
+
+    return generation;
+}
+
+std::unique_ptr<ReadBufferFromFileBase> BackupReaderAzureBlobStorage::readFile(const String & file_name, std::optional<size_t> expected_file_size)
+{
+    return readFilePinnedToGeneration(file_name, expected_file_size, /* generation */ "");
+}
+
+std::unique_ptr<ReadBufferFromFileBase> BackupReaderAzureBlobStorage::readFilePinnedToGeneration(
+    const String & file_name, std::optional<size_t> expected_file_size, const String & generation)
+{
+    String key = fs::path(blob_path) / file_name;
+    ObjectMetadata metadata = headBackupBlob(*object_storage, key);
+    /// Every restore path that reads through this buffer - the buffered fallback of
+    /// `copyFileToDisk`, and `BackupImpl::copyFileToDisk` with `sync` - copies exactly the number of
+    /// bytes the backup metadata records, so a blob that has been replaced by a longer one since the
+    /// backup was made would be restored as its first bytes and pass unnoticed. It is refused here,
+    /// before a single byte is read, the same way the native copy refuses it.
+    if (expected_file_size)
+        checkBackupBlobSize(key, metadata, *expected_file_size);
+
+    /// A caller that names a generation has read other bytes of this blob already - the `.backup`
+    /// entry of an archive, read through a buffer that is long gone by the time the archive reader
+    /// opens the next handle - and every later read has to land on the same generation. A blob that
+    /// holds another generation now is refused, including when it is of the very same size.
+    if (!generation.empty()
+        && AzureBlobStorage::normalizeETag(metadata.etag) != AzureBlobStorage::normalizeETag(generation))
+        throw Exception(ErrorCodes::FILE_CHANGED_DURING_READ,
+            "Blob {} of the backup was replaced while the backup was open: its `ETag` is {} instead of {}",
+            key, metadata.etag, generation);
+
     return std::make_unique<ReadBufferFromAzureBlobStorage>(
         client, key, read_settings, settings->max_single_read_retries,
-        settings->max_single_download_retries);
+        settings->max_single_download_retries,
+        /* use_external_buffer */ false,
+        /* restricted_seek */ false,
+        /* read_until_position */ 0,
+        /* blob_storage_log */ nullptr,
+        connection_params.getContainer(),
+        /* known_object_size */ metadata.size_bytes,
+        /* expected_etag */ generation.empty() ? metadata.etag : generation);
 }
 
 void BackupReaderAzureBlobStorage::copyFileToDisk(const String & path_in_backup, size_t file_size, bool encrypted_in_backup,
@@ -86,6 +257,10 @@ void BackupReaderAzureBlobStorage::copyFileToDisk(const String & path_in_backup,
         && destination_data_source_description.is_encrypted == encrypted_in_backup)
     {
         LOG_TRACE(log, "Copying {} from AzureBlobStorage to disk {}", path_in_backup, destination_disk->getName());
+        const String src_key = fs::path(blob_path) / path_in_backup;
+        const ObjectMetadata src_metadata = headBackupBlob(*object_storage, src_key);
+        checkBackupBlobSize(src_key, src_metadata, file_size);
+
         auto write_blob_function = [&](const Strings & dst_blob_path, WriteMode mode, const std::optional<ObjectAttributes> &) -> size_t
         {
             /// Object storage always uses mode `Rewrite` because it simulates append using metadata and different files.
@@ -98,14 +273,15 @@ void BackupReaderAzureBlobStorage::copyFileToDisk(const String & path_in_backup,
                 client,
                 destination_disk->getObjectStorage()->getAzureBlobStorageClient(),
                 connection_params.getContainer(),
-                fs::path(blob_path) / path_in_backup,
-                0,
+                src_key,
                 file_size,
+                src_metadata.etag,
                 /* dest_container */ dst_blob_path[1],
                 /* dest_path */ dst_blob_path[0],
                 settings,
                 read_settings,
-                threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), "BackupRDAzure"));
+                std::optional<ObjectAttributes>(),
+                threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::AZURE_BACKUP_READER));
 
             return file_size;
         };
@@ -128,7 +304,7 @@ BackupWriterAzureBlobStorage::BackupWriterAzureBlobStorage(
     const ContextPtr & context_,
     bool attempt_to_create_container)
     : BackupWriterDefault(read_settings_, write_settings_, getLogger("BackupWriterAzureBlobStorage"))
-    , data_source_description{DataSourceType::ObjectStorage, ObjectStorageType::Azure, MetadataStorageType::None, connection_params_.getConnectionURL(), false, false}
+    , data_source_description{DataSourceType::ObjectStorage, ObjectStorageType::Azure, MetadataStorageType::None, connection_params_.getConnectionURL(), false, false, ""}
     , connection_params(connection_params_)
     , blob_path(blob_path_)
 {
@@ -136,26 +312,25 @@ BackupWriterAzureBlobStorage::BackupWriterAzureBlobStorage(
         connection_params.endpoint.container_already_exists = true;
 
     auto client_ptr = AzureBlobStorage::getContainerClient(connection_params, /*readonly=*/ false);
-    auto settings_ptr = AzureBlobStorage::getRequestSettingsForBackup(context_->getSettingsRef(), allow_azure_native_copy);
+    auto settings_ptr = AzureBlobStorage::getRequestSettingsForBackup(context_, connection_params.endpoint.storage_account_url, allow_azure_native_copy);
 
     object_storage = std::make_unique<AzureObjectStorage>(
         "BackupWriterAzureBlobStorage",
+        connection_params.auth_method,
         std::move(client_ptr),
         std::move(settings_ptr),
+        connection_params,
         connection_params.getContainer(),
-        connection_params.getConnectionURL());
+        connection_params.getConnectionURL(),
+        /*common_key_prefix*/ "");
+
 
     client = object_storage->getAzureBlobStorageClient();
     settings = object_storage->getSettings();
 }
 
 void BackupWriterAzureBlobStorage::copyFileFromDisk(
-    const String & path_in_backup,
-    DiskPtr src_disk,
-    const String & src_path,
-    bool copy_encrypted,
-    UInt64 start_pos,
-    UInt64 length)
+    const String & path_in_backup, DiskPtr src_disk, const String & src_path, bool copy_encrypted, UInt64 start_pos, UInt64 length)
 {
     /// Use the native copy as a more optimal way to copy a file from AzureBlobStorage to AzureBlobStorage if it's possible.
     auto source_data_source_description = src_disk->getDataSourceDescription();
@@ -163,23 +338,70 @@ void BackupWriterAzureBlobStorage::copyFileFromDisk(
     if (source_data_source_description.object_storage_type == ObjectStorageType::Azure
         && source_data_source_description.is_encrypted == copy_encrypted)
     {
-        /// getBlobPath() can return more than 3 elements if the file is stored as multiple objects in AzureBlobStorage container.
+        /// getBlobPath() can return more than 2 elements if the file is stored as multiple objects in AzureBlobStorage container.
         /// In this case we can't use the native copy.
         if (auto src_blob_path = src_disk->getBlobPath(src_path); src_blob_path.size() == 2)
         {
-            LOG_TRACE(log, "Copying file {} from disk {} to AzureBlobStorag", src_path, src_disk->getName());
-            copyAzureBlobStorageFile(
-                src_disk->getObjectStorage()->getAzureBlobStorageClient(),
-                client,
-                /* src_container */ src_blob_path[1],
-                /* src_path */ src_blob_path[0],
-                start_pos,
-                length,
-                connection_params.getContainer(),
-                fs::path(blob_path) / path_in_backup,
-                settings,
-                read_settings,
-                threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), "BackupWRAzure"));
+            /// The Azure-to-Azure copy transfers the whole source blob, so it can be used only when the
+            /// request covers the entire source. `start_pos != 0` is not a sound test, because a prefix
+            /// [0, length) of a bigger file is a range too. `length` counts the bytes actually copied,
+            /// so an encrypted source must be measured with its encrypted size.
+            const size_t source_size
+                = copy_encrypted ? src_disk->getEncryptedFileSize(src_path) : src_disk->getFileSize(src_path);
+
+            if ((start_pos == 0) && (length == source_size))
+            {
+                LOG_TRACE(log, "Copying file {} from disk {} to AzureBlobStorage", src_path, src_disk->getName());
+                /// The generation of the source blob, so that the copy is refused rather than taking
+                /// another generation if the blob is replaced between this `HEAD` and the copy. The same
+                /// `HEAD` measures the blob: a blob of another size than the disk reported is already
+                /// another generation, whose copy would not be `length` bytes long.
+                const auto src_object_storage = src_disk->getObjectStorage();
+                const String src_etag = headSourceBlobOfBackupCopy(*src_object_storage, src_blob_path[0], length);
+                copyAzureBlobStorageFile(
+                    src_object_storage->getAzureBlobStorageClient(),
+                    client,
+                    /* src_container */ src_blob_path[1],
+                    /* src_path */ src_blob_path[0],
+                    length,
+                    src_etag,
+                    connection_params.getContainer(),
+                    fs::path(blob_path) / path_in_backup,
+                    settings,
+                    read_settings,
+                    std::optional<ObjectAttributes>(),
+                    threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::AZURE_BACKUP_WRITER));
+                return; /// copied!
+            }
+
+            /// An Azure-to-Azure copy transfers a whole blob, so a part of one is read and written
+            /// through buffers. The read is still pinned to a single generation of the source blob:
+            /// it goes to the blob itself rather than through `src_disk->readFile`, which on a
+            /// `plain` or `plain_rewritable` disk is unpinned (see `readSourceBlobOfBackupCopy`).
+            /// The `HEAD` is taken once, so every buffer the copy makes - the first one and the ones
+            /// of its retries - reads the same generation.
+            LOG_TRACE(
+                log,
+                "Copying the range [{}, {}) of file {} of size {} from disk {} through a pinned read "
+                "of the source blob: an Azure-to-Azure copy cannot copy a part of a blob",
+                start_pos, start_pos + length, src_path, source_size, src_disk->getName());
+
+            const auto src_object_storage = src_disk->getObjectStorage();
+            const String src_etag = headSourceBlobOfBackupCopy(*src_object_storage, src_blob_path[0], source_size);
+
+            /// The request settings of the backup, not of the source disk: the only fields the read
+            /// consumes are the retry counts, and `IObjectStorage` does not expose the settings of
+            /// the source in a way that would let them be taken from it.
+            auto create_read_buffer
+                = [src_client = src_object_storage->getAzureBlobStorageClient(), src_container = src_blob_path[1],
+                   src_key = src_blob_path[0], source_size, src_etag, request_settings = settings,
+                   buffer_settings = read_settings.adjustBufferSize(start_pos + length)]
+            {
+                return readSourceBlobOfBackupCopy(
+                    src_client, src_container, src_key, source_size, src_etag, buffer_settings, *request_settings);
+            };
+
+            copyDataToFile(path_in_backup, create_read_buffer, start_pos, length);
             return; /// copied!
         }
     }
@@ -191,18 +413,23 @@ void BackupWriterAzureBlobStorage::copyFileFromDisk(
 void BackupWriterAzureBlobStorage::copyFile(const String & destination, const String & source, size_t size)
 {
     LOG_TRACE(log, "Copying file inside backup from {} to {} ", source, destination);
+    const String src_key = fs::path(blob_path) / source;
+    const ObjectMetadata src_metadata = headBackupBlob(*object_storage, src_key);
+    checkBackupBlobSize(src_key, src_metadata, size);
+
     copyAzureBlobStorageFile(
        client,
        client,
        connection_params.getContainer(),
-       fs::path(blob_path)/ source,
-       0,
+       src_key,
        size,
+       src_metadata.etag,
        /* dest_container */ connection_params.getContainer(),
-       /* dest_path */ destination,
+       /* dest_path */ fs::path(blob_path) / destination,
        settings,
        read_settings,
-       threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), "BackupWRAzure"));
+       std::optional<ObjectAttributes>(),
+       threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::AZURE_BACKUP_WRITER));
 }
 
 void BackupWriterAzureBlobStorage::copyDataToFile(
@@ -220,10 +447,15 @@ void BackupWriterAzureBlobStorage::copyDataToFile(
         fs::path(blob_path) / path_in_backup,
         settings,
         threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(),
-        "BackupWRAzure"));
+        ThreadName::AZURE_BACKUP_WRITER));
 }
 
 BackupWriterAzureBlobStorage::~BackupWriterAzureBlobStorage() = default;
+
+std::map<String, String> BackupWriterAzureBlobStorage::getSerializedSettings() const
+{
+    return serializeAzureRequestSettings(*settings, read_settings);
+}
 
 bool BackupWriterAzureBlobStorage::fileExists(const String & file_name)
 {
@@ -234,19 +466,24 @@ bool BackupWriterAzureBlobStorage::fileExists(const String & file_name)
 UInt64 BackupWriterAzureBlobStorage::getFileSize(const String & file_name)
 {
     String key = fs::path(blob_path) / file_name;
-    RelativePathsWithMetadata children;
-    object_storage->listObjects(key,children,/*max_keys*/0);
-    if (children.empty())
-        throw Exception(ErrorCodes::AZURE_BLOB_STORAGE_ERROR, "Object must exist");
-    return children[0]->metadata->size_bytes;
+    ObjectMetadata object_metadata = object_storage->getObjectMetadata(key, /*with_tags=*/ false);
+    return object_metadata.size_bytes;
 }
 
 std::unique_ptr<ReadBuffer> BackupWriterAzureBlobStorage::readFile(const String & file_name, size_t /*expected_file_size*/)
 {
     String key = fs::path(blob_path) / file_name;
+    ObjectMetadata metadata = headBackupBlob(*object_storage, key);
     return std::make_unique<ReadBufferFromAzureBlobStorage>(
         client, key, read_settings, settings->max_single_read_retries,
-        settings->max_single_download_retries);
+        settings->max_single_download_retries,
+        /* use_external_buffer */ false,
+        /* restricted_seek */ false,
+        /* read_until_position */ 0,
+        /* blob_storage_log */ nullptr,
+        connection_params.getContainer(),
+        /* known_object_size */ metadata.size_bytes,
+        /* expected_etag */ metadata.etag);
 }
 
 std::unique_ptr<WriteBuffer> BackupWriterAzureBlobStorage::writeFile(const String & file_name)
@@ -258,7 +495,25 @@ std::unique_ptr<WriteBuffer> BackupWriterAzureBlobStorage::writeFile(const Strin
         DBMS_DEFAULT_BUFFER_SIZE,
         write_settings,
         settings,
-        threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), "BackupWRAzure"));
+        connection_params.getContainer(),
+        /* blob_log */ nullptr,
+        threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::AZURE_BACKUP_WRITER));
+}
+
+std::unique_ptr<WriteBuffer> BackupWriterAzureBlobStorage::writeFileIfNotExists(const String & file_name)
+{
+    String key = fs::path(blob_path) / file_name;
+    WriteSettings conditional_write_settings = write_settings;
+    conditional_write_settings.object_storage_write_if_none_match = "*";
+    return std::make_unique<WriteBufferFromAzureBlobStorage>(
+        client,
+        key,
+        DBMS_DEFAULT_BUFFER_SIZE,
+        conditional_write_settings,
+        settings,
+        connection_params.getContainer(),
+        /* blob_log */ nullptr,
+        threadPoolCallbackRunnerUnsafe<void>(getBackupsIOThreadPool().get(), ThreadName::AZURE_BACKUP_WRITER));
 }
 
 void BackupWriterAzureBlobStorage::removeFile(const String & file_name)
@@ -276,15 +531,6 @@ void BackupWriterAzureBlobStorage::removeFiles(const Strings & file_names)
 
     object_storage->removeObjectsIfExist(objects);
 
-}
-
-void BackupWriterAzureBlobStorage::removeFilesBatch(const Strings & file_names)
-{
-    StoredObjects objects;
-    for (const auto & file_name : file_names)
-        objects.emplace_back(fs::path(blob_path) / file_name);
-
-    object_storage->removeObjectsIfExist(objects);
 }
 
 }

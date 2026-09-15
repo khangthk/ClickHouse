@@ -1,4 +1,3 @@
-import time
 import uuid
 
 import pytest
@@ -14,11 +13,13 @@ current = cluster.add_instance(
     "current",
     main_configs=["configs/remote_servers.xml"],
 )
-# Here analyzer is disabled by default
+# Here analyzer is disabled by default. The value is pinned explicitly all the same: only a changed
+# setting is sent to a remote server, so without it this initiator would leave the choice to the
+# other server, which has no way to analyze the query the old way anymore.
 backward = cluster.add_instance(
     "backward",
-    use_old_analyzer=True,
     main_configs=["configs/remote_servers.xml"],
+    user_configs=["configs/old_analyzer.xml"],
     image="clickhouse/clickhouse-server",
     tag=CLICKHOUSE_MAX_VERSION_WITH_ANALYZER_DISABLED_BY_DEFAULT,
     with_installed_binary=True,
@@ -43,7 +44,7 @@ def test_two_new_versions(start_cluster):
 
     query_id = str(uuid.uuid4())
     current.query(
-        "SELECT * FROM clusterAllReplicas('test_cluster_mixed', system.tables);",
+        "SELECT name FROM clusterAllReplicas('test_cluster_mixed', system.tables) settings serialize_query_plan=0;",
         query_id=query_id,
     )
 
@@ -55,7 +56,7 @@ def test_two_new_versions(start_cluster):
             """
 SELECT hostname() AS h, getSetting('allow_experimental_analyzer')
 FROM clusterAllReplicas('test_cluster_mixed', system.one)
-ORDER BY h;"""
+ORDER BY h settings serialize_query_plan=0;"""
         )
         == TSV([["backward", "true"], ["current", "true"]])
     )
@@ -73,7 +74,7 @@ WHERE initial_query_id = '{query_id}';"""
 
     query_id = str(uuid.uuid4())
     backward.query(
-        "SELECT * FROM clusterAllReplicas('test_cluster_mixed', system.tables)",
+        "SELECT name FROM clusterAllReplicas('test_cluster_mixed', system.tables)",
         query_id=query_id,
     )
 
@@ -108,7 +109,7 @@ WHERE initial_query_id = '{query_id}';"""
     # to the remote server.
     query_id = str(uuid.uuid4())
     current.query(
-        "SELECT * FROM clusterAllReplicas('test_cluster_mixed', system.tables) SETTINGS enable_analyzer = 1;",
+        "SELECT name FROM clusterAllReplicas('test_cluster_mixed', system.tables) SETTINGS enable_analyzer = 1, serialize_query_plan=0;",
         query_id=query_id,
     )
 

@@ -2,6 +2,7 @@
 #include <Interpreters/Access/InterpreterCreateRoleQuery.h>
 
 #include <Access/AccessControl.h>
+#include <Access/Common/AccessFlags.h>
 #include <Access/Role.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/executeDDLQueryOnCluster.h>
@@ -23,7 +24,7 @@ namespace
         Role & role,
         const ASTCreateRoleQuery & query,
         const String & override_name,
-        const std::optional<SettingsProfileElements> & override_settings)
+        const std::optional<AlterSettingsProfileElements> & override_settings)
     {
         if (!override_name.empty())
             role.setName(override_name);
@@ -33,9 +34,11 @@ namespace
             role.setName(query.names.front());
 
         if (override_settings)
-            role.settings = *override_settings;
+            role.settings.applyChanges(*override_settings);
+        else if (query.alter_settings)
+            role.settings.applyChanges(AlterSettingsProfileElements{*query.alter_settings});
         else if (query.settings)
-            role.settings = *query.settings;
+            role.settings.applyChanges(AlterSettingsProfileElements{*query.settings});
     }
 }
 
@@ -46,19 +49,29 @@ BlockIO InterpreterCreateRoleQuery::execute()
     const auto & query = updated_query_ptr->as<const ASTCreateRoleQuery &>();
 
     auto & access_control = getContext()->getAccessControl();
-    if (query.alter)
-        getContext()->checkAccess(AccessType::ALTER_ROLE);
-    else
-        getContext()->checkAccess(AccessType::CREATE_ROLE);
 
-    std::optional<SettingsProfileElements> settings_from_query;
-    if (query.settings)
-    {
-        settings_from_query = SettingsProfileElements{*query.settings, access_control};
+    /// `CREATE ROLE OR REPLACE` throws away the privileges granted to an existing role of the same name,
+    /// so it is a drop followed by a create and requires the privileges of both. `DROP ROLE` is required
+    /// whether or not the role currently exists, mirroring `REPLACE TABLE`, so that the check does not
+    /// reveal which roles exist either.
+    AccessFlags access_type = query.alter ? AccessType::ALTER_ROLE : AccessType::CREATE_ROLE;
+    if (query.or_replace)
+        access_type |= AccessType::DROP_ROLE;
 
-        if (!query.attach)
-            getContext()->checkSettingsConstraints(*settings_from_query, SettingSource::ROLE);
-    }
+    for (const auto & name : query.names)
+        getContext()->checkAccess(access_type, name);
+
+    if (!query.new_name.empty() && !query.alter)
+        getContext()->checkAccess(AccessType::CREATE_ROLE, query.new_name);
+
+    std::optional<AlterSettingsProfileElements> settings_from_query;
+    if (query.alter_settings)
+        settings_from_query = AlterSettingsProfileElements{*query.alter_settings, access_control};
+    else if (query.settings)
+        settings_from_query = AlterSettingsProfileElements{SettingsProfileElements(*query.settings, access_control)};
+
+    if (settings_from_query && !query.attach)
+        getContext()->checkSettingsConstraints(*settings_from_query, SettingSource::ROLE);
 
     if (!query.cluster.empty())
         return executeDDLQueryOnCluster(updated_query_ptr, getContext());
@@ -124,6 +137,7 @@ void InterpreterCreateRoleQuery::updateRoleFromQuery(Role & role, const ASTCreat
     updateRoleFromQueryImpl(role, query, {}, {});
 }
 
+void registerInterpreterCreateRoleQuery(InterpreterFactory & factory);
 void registerInterpreterCreateRoleQuery(InterpreterFactory & factory)
 {
     auto create_fn = [] (const InterpreterFactory::Arguments & args)

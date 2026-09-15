@@ -1,4 +1,5 @@
-#include "StorageSystemProjectionParts.h"
+#include <Storages/System/StorageSystemProjectionParts.h>
+#include <Storages/System/SystemTableSourceRegistry.h>
 
 #include <Common/escapeForFileName.h>
 #include <Columns/ColumnString.h>
@@ -10,7 +11,6 @@
 #include <DataTypes/DataTypeUUID.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Databases/IDatabase.h>
-#include <Parsers/queryToString.h>
 #include <base/hex.h>
 
 namespace DB
@@ -71,7 +71,7 @@ StorageSystemProjectionParts::StorageSystemProjectionParts(const StorageID & tab
         {"move_ttl_info.min",                           std::make_shared<DataTypeArray>(std::make_shared<DataTypeDateTime>()), "Array of date and time values. Each element describes the minimum key value for a TTL MOVE rule."},
         {"move_ttl_info.max",                           std::make_shared<DataTypeArray>(std::make_shared<DataTypeDateTime>()), "Array of date and time values. Each element describes the maximum key value for a TTL MOVE rule."},
 
-        {"default_compression_codec",                   std::make_shared<DataTypeString>(), "The name of the codec used to compress this data part (in case when there is no explicit codec for columns)."},
+        {"default_compression_codec",                   std::make_shared<DataTypeString>(), "The name of the codec used to compress this data part (in case when there is no explicit codec for columns). `UNKNOWN` means this codec could not be recovered exactly from the part metadata."},
 
         {"recompression_ttl_info.expression",           std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()),   "The TTL expression."},
         {"recompression_ttl_info.min",                  std::make_shared<DataTypeArray>(std::make_shared<DataTypeDateTime>()), "The minimum value of the calculated TTL expression within this part. Used to understand whether we have at least one row with expired TTL."},
@@ -109,13 +109,10 @@ void StorageSystemProjectionParts::processNextStorage(
         ColumnSize columns_size = part->getTotalColumnsSize();
         ColumnSize parent_columns_size = parent_part->getTotalColumnsSize();
 
-        size_t src_index = 0, res_index = 0;
+        size_t src_index = 0;
+        size_t res_index = 0;
         if (columns_mask[src_index++])
-        {
-            WriteBufferFromOwnString out;
-            parent_part->partition.serializeText(*info.data, out, format_settings);
-            columns[res_index++]->insert(out.str());
-        }
+            columns[res_index++]->insert(parent_part->partition.serializeToString(parent_part->getMetadataSnapshot()));
         if (columns_mask[src_index++])
             columns[res_index++]->insert(part->name);
         if (columns_mask[src_index++])
@@ -177,7 +174,7 @@ void StorageSystemProjectionParts::processNextStorage(
         if (columns_mask[src_index++])
             columns[res_index++]->insert(static_cast<UInt32>(min_max_time.second));
         if (columns_mask[src_index++])
-            columns[res_index++]->insert(parent_part->info.partition_id);
+            columns[res_index++]->insert(parent_part->info.getPartitionId());
         if (columns_mask[src_index++])
             columns[res_index++]->insert(parent_part->info.min_block);
         if (columns_mask[src_index++])
@@ -200,21 +197,10 @@ void StorageSystemProjectionParts::processNextStorage(
         if (columns_mask[src_index++])
             columns[res_index++]->insert(info.engine);
 
-        if (part->isStoredOnDisk())
-        {
-            if (columns_mask[src_index++])
-                columns[res_index++]->insert(part->getDataPartStorage().getDiskName());
-            if (columns_mask[src_index++])
-                columns[res_index++]->insert(part->getDataPartStorage().getFullPath());
-        }
-        else
-        {
-            if (columns_mask[src_index++])
-                columns[res_index++]->insertDefault();
-            if (columns_mask[src_index++])
-                columns[res_index++]->insertDefault();
-        }
-
+        if (columns_mask[src_index++])
+            columns[res_index++]->insert(part->getDataPartStorage().getDiskName());
+        if (columns_mask[src_index++])
+            columns[res_index++]->insert(part->getDataPartStorage().getFullPath());
 
         {
             MinimalisticDataPartChecksums helper;
@@ -276,8 +262,10 @@ void StorageSystemProjectionParts::processNextStorage(
 
         if (columns_mask[src_index++])
         {
-            if (part->default_codec)
-                columns[res_index++]->insert(queryToString(part->default_codec->getCodecDesc()));
+            if (part->default_codec_is_approximate)
+                columns[res_index++]->insert("UNKNOWN");
+            else if (part->default_codec)
+                columns[res_index++]->insert(part->default_codec->getCodecDescription()->formatForLogging());
             else
                 columns[res_index++]->insertDefault();
         }
@@ -315,3 +303,6 @@ void StorageSystemProjectionParts::processNextStorage(
 }
 
 }
+
+/// Register the source file of this system table for `system.documentation`.
+namespace DB { REGISTER_SYSTEM_TABLE_SOURCE(StorageSystemProjectionParts) }

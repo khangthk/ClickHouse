@@ -1,5 +1,6 @@
+#include <memory>
+#include <Analyzer/IQueryTreeNode.h>
 #include <Parsers/ASTSubquery.h>
-#include <Parsers/queryToString.h>
 #include <Storages/transformQueryForExternalDatabaseAnalyzer.h>
 
 #include <Parsers/ASTSelectWithUnionQuery.h>
@@ -8,12 +9,12 @@
 
 #include <Columns/ColumnConst.h>
 
+#include <Analyzer/Utils.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/ConstantNode.h>
-#include <Analyzer/ConstantValue.h>
+#include <Analyzer/FunctionNode.h>
 #include <Analyzer/JoinNode.h>
 
-#include <DataTypes/DataTypesNumber.h>
 
 namespace DB
 {
@@ -45,11 +46,11 @@ public:
                 /// The code is ugly - how to convert artbitrary Field to proper string representation?
                 /// (maybe we can just consider numbers as unix timestamps?)
                 auto result_column = result_type->createColumnConst(1, constant_node->getValue());
-                const IColumn & inner_column = assert_cast<const ColumnConst &>(*result_column).getDataColumn();
+                const IColumn & inner_column = result_column->getDataColumn();
 
                 WriteBufferFromOwnString out;
                 result_type->getDefaultSerialization()->serializeText(inner_column, 0, out, FormatSettings());
-                node = std::make_shared<ConstantNode>(std::make_shared<ConstantValue>(out.str(), result_type));
+                node = std::make_shared<ConstantNode>(out.str(), std::move(result_type));
             }
         }
     }
@@ -57,27 +58,41 @@ public:
 
 }
 
-ASTPtr getASTForExternalDatabaseFromQueryTree(const QueryTreeNodePtr & query_tree, const QueryTreeNodePtr & table_expression)
+ASTPtr getASTForExternalDatabaseFromQueryTree(ContextPtr context, const QueryTreeNodePtr & query_tree, const TableExpressionNodePtr & table_expression)
 {
-    auto new_tree = query_tree->clone();
+    auto replacement_table_expression = table_expression->clone();
+    auto new_tree = query_tree->cloneAndReplace(table_expression, static_pointer_cast<ITableExpressionNode>(replacement_table_expression));
 
     PrepareForExternalDatabaseVisitor visitor;
     visitor.visit(new_tree);
-    const auto * query_node = new_tree->as<QueryNode>();
+    auto * query_node = new_tree->as<QueryNode>();
 
-    const auto & join_tree = query_node->getJoinTree();
+    const auto & join_tree = query_node->getJoinTreeNode();
     bool allow_where = true;
     if (const auto * join_node = join_tree->as<JoinNode>())
     {
         if (join_node->getKind() == JoinKind::Left)
-            allow_where = join_node->getLeftTableExpression()->isEqual(*table_expression);
+            allow_where = join_node->getLeftTableExpressionNode()->isEqual(*replacement_table_expression);
         else if (join_node->getKind() == JoinKind::Right)
-            allow_where = join_node->getRightTableExpression()->isEqual(*table_expression);
+            allow_where = join_node->getRightTableExpressionNode()->isEqual(*replacement_table_expression);
         else
             allow_where = (join_node->getKind() == JoinKind::Inner);
     }
 
-    auto query_node_ast = query_node->toAST({ .add_cast_for_constants = false, .fully_qualified_identifiers = false });
+    /// Remove all sub-expressions (operands of AND) that depend on columns from other tables.
+    /// This is needed for a correct push-down of these filters to an external storage.
+    if (allow_where)
+    {
+        if (query_node->hasPrewhere())
+            removeExpressionsThatDoNotDependOnTableIdentifiers(query_node->getPrewhere(), replacement_table_expression, context);
+        if (query_node->hasWhere())
+            removeExpressionsThatDoNotDependOnTableIdentifiers(query_node->getWhere(), replacement_table_expression, context);
+    }
+
+    /// The external database parses this text itself, so a date-time constant must stay in its text form.
+    auto query_node_ast = query_node->toAST({ .add_cast_for_constants = false,
+                                              .date_time_constants_as_numbers = false,
+                                              .fully_qualified_identifiers = false });
     const IAST * ast = query_node_ast.get();
 
     if (const auto * ast_subquery = ast->as<ASTSubquery>())
@@ -95,7 +110,15 @@ ASTPtr getASTForExternalDatabaseFromQueryTree(const QueryTreeNodePtr & query_tre
     if (!select_query_typed)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected ASTSelectQuery, got {}", select_query ? select_query->formatForErrorMessage() : "nullptr");
     if (!allow_where)
+    {
+        /// Nothing is pushed down from this side of the join, so neither filter may reach the external
+        /// database. `PREWHERE` has to go as well: the external table engines do not support it, so a
+        /// surviving `PREWHERE` can only belong to the other, joined table and must not be presented to
+        /// the caller as a filter on this one (`rejectOuterFilterForQueryBackedExternalSourceIfStrict`
+        /// would otherwise reject it).
         select_query_typed->setExpression(ASTSelectQuery::Expression::WHERE, nullptr);
+        select_query_typed->setExpression(ASTSelectQuery::Expression::PREWHERE, nullptr);
+    }
     return select_query;
 }
 

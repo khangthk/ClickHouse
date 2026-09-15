@@ -1,9 +1,15 @@
 #include <Columns/IColumn.h>
 #include <Columns/ColumnVector.h>
+#include <Common/Exception.h>
 #include <Common/typeid_cast.h>
 #include <Common/HashTable/HashSet.h>
 #include <bit>
-#include "ColumnsCommon.h"
+#include <cstring>
+#include <Columns/ColumnsCommon.h>
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 
 namespace DB
@@ -30,6 +36,12 @@ static UInt64 toBits64(const Int8 * bytes64)
 
 size_t countBytesInFilter(const UInt8 * filt, size_t start, size_t end)
 {
+    if (start == end)
+        return 0;
+
+    chassert(start <= end);
+    chassert(filt != nullptr);
+
     size_t count = 0;
 
     /** NOTE: In theory, `filt` should only contain zeros and ones.
@@ -49,6 +61,60 @@ size_t countBytesInFilter(const UInt8 * filt, size_t start, size_t end)
         count += std::popcount(toBits64(pos));
 
     /// TODO Add duff device for tail?
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    constexpr size_t chunk_size = 255 * 64;
+    const uint8x16_t zero = vdupq_n_u8(0);
+
+    while (static_cast<size_t>(end_pos - pos) >= chunk_size)
+    {
+        uint8x16_t acc0 = vdupq_n_u8(0);
+        uint8x16_t acc1 = vdupq_n_u8(0);
+        uint8x16_t acc2 = vdupq_n_u8(0);
+        uint8x16_t acc3 = vdupq_n_u8(0);
+
+        for (size_t i = 0; i < 255; ++i)
+        {
+            acc0 = vsubq_u8(acc0, vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos)), zero));
+            acc1 = vsubq_u8(acc1, vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 16)), zero));
+            acc2 = vsubq_u8(acc2, vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 32)), zero));
+            acc3 = vsubq_u8(acc3, vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 48)), zero));
+            pos += 64;
+        }
+
+        uint16x8_t acc16 = vdupq_n_u16(0);
+        acc16 = vpadalq_u8(acc16, acc0);
+        acc16 = vpadalq_u8(acc16, acc1);
+        acc16 = vpadalq_u8(acc16, acc2);
+        acc16 = vpadalq_u8(acc16, acc3);
+
+        count += vaddlvq_u16(acc16);
+    }
+
+    size_t rem_blocks = static_cast<size_t>(end_pos - pos) / 64;
+    if (rem_blocks > 0)
+    {
+        uint8x16_t acc0 = vdupq_n_u8(0);
+        uint8x16_t acc1 = vdupq_n_u8(0);
+        uint8x16_t acc2 = vdupq_n_u8(0);
+        uint8x16_t acc3 = vdupq_n_u8(0);
+
+        for (size_t i = 0; i < rem_blocks; ++i)
+        {
+            acc0 = vsubq_u8(acc0, vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos)), zero));
+            acc1 = vsubq_u8(acc1, vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 16)), zero));
+            acc2 = vsubq_u8(acc2, vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 32)), zero));
+            acc3 = vsubq_u8(acc3, vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 48)), zero));
+            pos += 64;
+        }
+
+        uint16x8_t acc16 = vdupq_n_u16(0);
+        acc16 = vpadalq_u8(acc16, acc0);
+        acc16 = vpadalq_u8(acc16, acc1);
+        acc16 = vpadalq_u8(acc16, acc2);
+        acc16 = vpadalq_u8(acc16, acc3);
+
+        count += vaddlvq_u16(acc16);
+    }
 #endif
 
     for (; pos < end_pos; ++pos)
@@ -64,6 +130,13 @@ size_t countBytesInFilter(const IColumn::Filter & filt)
 
 size_t countBytesInFilterWithNull(const IColumn::Filter & filt, const UInt8 * null_map, size_t start, size_t end)
 {
+    if (start == end)
+        return 0;
+
+    chassert(start <= end);
+    chassert(filt.data() != nullptr);
+    chassert(null_map != nullptr);
+
     size_t count = 0;
 
     /** NOTE: In theory, `filt` should only contain zeros and ones.
@@ -82,17 +155,99 @@ size_t countBytesInFilterWithNull(const IColumn::Filter & filt, const UInt8 * nu
         count += std::popcount(toBits64(pos) & ~toBits64(pos2));
 
         /// TODO Add duff device for tail?
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    constexpr size_t chunk_size = 255 * 64;
+    const uint8x16_t zero = vdupq_n_u8(0);
+
+    while (static_cast<size_t>(end_pos - pos) >= chunk_size)
+    {
+        uint8x16_t acc0 = vdupq_n_u8(0);
+        uint8x16_t acc1 = vdupq_n_u8(0);
+        uint8x16_t acc2 = vdupq_n_u8(0);
+        uint8x16_t acc3 = vdupq_n_u8(0);
+
+        for (size_t i = 0; i < 255; ++i)
+        {
+            uint8x16_t m0 = vandq_u8(
+                vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos)), zero),
+                vceqzq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos2))));
+            uint8x16_t m1 = vandq_u8(
+                vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 16)), zero),
+                vceqzq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos2 + 16))));
+            uint8x16_t m2 = vandq_u8(
+                vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 32)), zero),
+                vceqzq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos2 + 32))));
+            uint8x16_t m3 = vandq_u8(
+                vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 48)), zero),
+                vceqzq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos2 + 48))));
+
+            acc0 = vsubq_u8(acc0, m0);
+            acc1 = vsubq_u8(acc1, m1);
+            acc2 = vsubq_u8(acc2, m2);
+            acc3 = vsubq_u8(acc3, m3);
+            pos += 64;
+            pos2 += 64;
+        }
+
+        uint16x8_t acc16 = vdupq_n_u16(0);
+        acc16 = vpadalq_u8(acc16, acc0);
+        acc16 = vpadalq_u8(acc16, acc1);
+        acc16 = vpadalq_u8(acc16, acc2);
+        acc16 = vpadalq_u8(acc16, acc3);
+
+        count += vaddlvq_u16(acc16);
+    }
+
+    size_t rem_blocks = static_cast<size_t>(end_pos - pos) / 64;
+    if (rem_blocks > 0)
+    {
+        uint8x16_t acc0 = vdupq_n_u8(0);
+        uint8x16_t acc1 = vdupq_n_u8(0);
+        uint8x16_t acc2 = vdupq_n_u8(0);
+        uint8x16_t acc3 = vdupq_n_u8(0);
+
+        for (size_t i = 0; i < rem_blocks; ++i)
+        {
+            uint8x16_t m0 = vandq_u8(
+                vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos)), zero),
+                vceqzq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos2))));
+            uint8x16_t m1 = vandq_u8(
+                vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 16)), zero),
+                vceqzq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos2 + 16))));
+            uint8x16_t m2 = vandq_u8(
+                vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 32)), zero),
+                vceqzq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos2 + 32))));
+            uint8x16_t m3 = vandq_u8(
+                vcgtq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos + 48)), zero),
+                vceqzq_u8(vld1q_u8(reinterpret_cast<const uint8_t *>(pos2 + 48))));
+
+            acc0 = vsubq_u8(acc0, m0);
+            acc1 = vsubq_u8(acc1, m1);
+            acc2 = vsubq_u8(acc2, m2);
+            acc3 = vsubq_u8(acc3, m3);
+            pos += 64;
+            pos2 += 64;
+        }
+
+        uint16x8_t acc16 = vdupq_n_u16(0);
+        acc16 = vpadalq_u8(acc16, acc0);
+        acc16 = vpadalq_u8(acc16, acc1);
+        acc16 = vpadalq_u8(acc16, acc2);
+        acc16 = vpadalq_u8(acc16, acc3);
+
+        count += vaddlvq_u16(acc16);
+    }
 #endif
 
     for (; pos < end_pos; ++pos, ++pos2)
-        count += (*pos & ~*pos2) != 0;
+        count += (*pos != 0 && *pos2 == 0);
 
     return count;
 }
 
-std::vector<size_t> countColumnsSizeInSelector(IColumn::ColumnIndex num_columns, const IColumn::Selector & selector)
+VectorWithMemoryTracking<size_t> countColumnsSizeInSelector(size_t num_columns, const IColumn::Selector & selector)
 {
-    std::vector<size_t> counts(num_columns);
+    VectorWithMemoryTracking<size_t> counts(num_columns);
     for (auto idx : selector)
         ++counts[idx];
 
@@ -115,7 +270,19 @@ bool memoryIsZero(const void * data, size_t start, size_t end)
 
 namespace ErrorCodes
 {
+    extern const int LOGICAL_ERROR;
     extern const int SIZES_OF_COLUMNS_DOESNT_MATCH;
+}
+
+void throwIndexesSizeTooSmall(size_t indexes_size, size_t limit)
+{
+    throw Exception(ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH,
+        "Size of indexes ({}) is less than required ({})", indexes_size, limit);
+}
+
+void throwUnsupportedIndexesColumnType(const std::string & name)
+{
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Indexes column for IColumn::select must be ColumnUInt, got {}", name);
 }
 
 
@@ -187,6 +354,43 @@ namespace
         }
     };
 
+    struct InPlaceResultOffsetsBuilder
+    {
+        IColumn::Offset * res_offsets;
+        IColumn::Offset current_src_offset = 0;
+        size_t size = 0;
+
+        explicit InPlaceResultOffsetsBuilder(IColumn::Offset * res_offsets_) : res_offsets(res_offsets_) {}
+
+        void insertOne(size_t array_size)
+        {
+            current_src_offset += array_size;
+            res_offsets[size] = current_src_offset;
+            ++size;
+        }
+
+        template <size_t SIMD_BYTES>
+        void insertChunk(
+            const IColumn::Offset * src_offsets_pos,
+            IColumn::Offset chunk_offset,
+            size_t chunk_size)
+        {
+            /// difference between current and actual offset
+            const auto diff_offset = chunk_offset - current_src_offset;
+
+            memmove(&res_offsets[size], src_offsets_pos, SIMD_BYTES * sizeof(IColumn::Offset));
+
+            if (diff_offset)
+            {
+                /// adjust offsets
+                for (size_t i = 0; i < SIMD_BYTES; ++i)
+                    res_offsets[size + i] -= diff_offset;
+            }
+
+            size += SIMD_BYTES;
+            current_src_offset += chunk_size;
+        }
+    };
 
     template <typename T, typename ResultOffsetsBuilder>
     void filterArraysImplGeneric(
@@ -219,7 +423,7 @@ namespace
         /// copy array ending at *end_offset_ptr
         const auto copy_array = [&] (const IColumn::Offset * offset_ptr)
         {
-            const auto arr_offset = offset_ptr == offsets_begin ? 0 : offset_ptr[-1];
+            const auto arr_offset = offset_ptr[-1];
             const auto arr_size = *offset_ptr - arr_offset;
 
             result_offsets_builder.insertOne(arr_size);
@@ -246,7 +450,7 @@ namespace
                 /// SIMD_BYTES consecutive rows pass the filter
                 const auto first = offsets_pos == offsets_begin;
 
-                const auto chunk_offset = first ? 0 : offsets_pos[-1];
+                const auto chunk_offset = offsets_pos[-1];
                 const auto chunk_size = offsets_pos[SIMD_BYTES - 1] - chunk_offset;
 
                 result_offsets_builder.template insertChunk<SIMD_BYTES>(offsets_pos, first, chunk_offset, chunk_size);
@@ -296,6 +500,93 @@ void filterArraysImpl(
 }
 
 template <typename T>
+void filterArraysImplInPlace(
+    PaddedPODArray<T> & elems, IColumn::Offsets & offsets,
+    const IColumn::Filter & filt)
+{
+    const size_t size = offsets.size();
+    if (size != filt.size())
+        throw Exception(ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH, "Size of filter ({}) doesn't match size of column ({})", filt.size(), size);
+
+    const UInt8 * filt_pos = filt.data();
+    const auto * filt_end = filt_pos + size;
+
+    auto * offsets_pos = offsets.data();
+    auto * elem_pos = elems.data();
+    size_t res_elems_size = 0;
+
+    InPlaceResultOffsetsBuilder result_offsets_builder(offsets_pos);
+
+    const auto copy_array_inplace = [&] (const IColumn::Offset * offset_ptr)
+    {
+        const auto arr_offset = offset_ptr[-1];
+        const auto arr_size = *offset_ptr - arr_offset;
+
+        result_offsets_builder.insertOne(arr_size);
+
+        memmove(&elem_pos[res_elems_size], &elem_pos[arr_offset], arr_size * sizeof(T));
+
+        res_elems_size += arr_size;
+    };
+
+    /** A slightly more optimized version.
+    * Based on the assumption that often pieces of consecutive values
+    *  completely pass or do not pass the filter.
+    * Therefore, we will optimistically check the parts of `SIMD_BYTES` values.
+    */
+    static constexpr size_t SIMD_BYTES = 64;
+    const auto * filt_end_aligned = filt_pos + size / SIMD_BYTES * SIMD_BYTES;
+
+    while (filt_pos < filt_end_aligned)
+    {
+        uint64_t mask = bytes64MaskToBits64Mask(filt_pos);
+
+        if (0xffffffffffffffff == mask)
+        {
+            /// SIMD_BYTES consecutive rows pass the filter
+            const auto chunk_offset = offsets_pos[-1];
+            const auto chunk_size = offsets_pos[SIMD_BYTES - 1] - chunk_offset;
+
+            result_offsets_builder.insertChunk<SIMD_BYTES>(offsets_pos, chunk_offset, chunk_size);
+
+            /// copy elements for SIMD_BYTES arrays at once
+            memmove(&elem_pos[res_elems_size], &elem_pos[chunk_offset], chunk_size * sizeof(T));
+
+            res_elems_size += chunk_size;
+        }
+        else
+        {
+            while (mask)
+            {
+                size_t index = std::countr_zero(mask);
+                copy_array_inplace(offsets_pos + index);
+            #ifdef __BMI__
+                mask = _blsr_u64(mask);
+            #else
+                mask = mask & (mask-1);
+            #endif
+            }
+        }
+
+        filt_pos += SIMD_BYTES;
+        offsets_pos += SIMD_BYTES;
+    }
+
+    while (filt_pos < filt_end)
+    {
+        if (*filt_pos)
+            copy_array_inplace(offsets_pos);
+
+        ++filt_pos;
+        ++offsets_pos;
+    }
+
+    /// Resize to actual sizes
+    elems.resize_assume_reserved(res_elems_size);
+    offsets.resize_assume_reserved(result_offsets_builder.size);
+}
+
+template <typename T>
 void filterArraysImplOnlyData(
     const PaddedPODArray<T> & src_elems, const IColumn::Offsets & src_offsets,
     PaddedPODArray<T> & res_elems,
@@ -314,7 +605,10 @@ template void filterArraysImpl<TYPE>( \
 template void filterArraysImplOnlyData<TYPE>( \
     const PaddedPODArray<TYPE> &, const IColumn::Offsets &, \
     PaddedPODArray<TYPE> &, \
-    const IColumn::Filter &, ssize_t);
+    const IColumn::Filter &, ssize_t); \
+template void filterArraysImplInPlace<TYPE>( \
+    PaddedPODArray<TYPE> &, IColumn::Offsets &, \
+    const IColumn::Filter &);
 
 INSTANTIATE(UInt8)
 INSTANTIATE(UInt16)
@@ -328,6 +622,7 @@ INSTANTIATE(Int32)
 INSTANTIATE(Int64)
 INSTANTIATE(Int128)
 INSTANTIATE(Int256)
+INSTANTIATE(BFloat16)
 INSTANTIATE(Float32)
 INSTANTIATE(Float64)
 INSTANTIATE(Decimal32)

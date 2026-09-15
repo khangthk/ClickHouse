@@ -59,14 +59,13 @@ BlockIO InterpreterTransactionControlQuery::executeCommit(ContextMutablePtr sess
     {
         if (session_context->getClientInfo().interface == ClientInfo::Interface::MYSQL)
             return {};
-        else
-            throw Exception(ErrorCodes::INVALID_TRANSACTION, "There is no current transaction");
+        throw Exception(ErrorCodes::INVALID_TRANSACTION, "There is no current transaction");
     }
     if (txn->getState() != MergeTreeTransaction::RUNNING)
         throw Exception(ErrorCodes::INVALID_TRANSACTION, "Transaction is not in RUNNING state");
 
     TransactionsWaitCSNMode mode = query_context->getSettingsRef()[Setting::wait_changes_become_visible_after_commit_mode];
-    CSN csn;
+    CSN csn = 0;
     try
     {
         csn = TransactionLog::instance().commitTransaction(txn, /* throw_on_unknown_status */ mode != TransactionsWaitCSNMode::WAIT_UNKNOWN);
@@ -123,8 +122,7 @@ BlockIO InterpreterTransactionControlQuery::executeRollback(ContextMutablePtr se
     {
         if (session_context->getClientInfo().interface == ClientInfo::Interface::MYSQL)
             return {};
-        else
-            throw Exception(ErrorCodes::INVALID_TRANSACTION, "There is no current transaction");
+        throw Exception(ErrorCodes::INVALID_TRANSACTION, "There is no current transaction");
     }
     if (txn->getState() == MergeTreeTransaction::COMMITTED)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Transaction is in COMMITTED state");
@@ -143,13 +141,14 @@ BlockIO InterpreterTransactionControlQuery::executeSetSnapshot(ContextMutablePtr
     if (!txn)
         throw Exception(ErrorCodes::INVALID_TRANSACTION, "There is no current transaction");
 
-    if (snapshot <= Tx::MaxReservedCSN && snapshot != Tx::PrehistoricCSN && snapshot != Tx::EverythingVisibleCSN)
+    if (snapshot <= Tx::MaxReservedCSN && snapshot != Tx::NonTransactionalCSN && snapshot != Tx::EverythingVisibleCSN)
         throw Exception(ErrorCodes::INVALID_TRANSACTION, "Cannot set snapshot to reserved CSN");
 
     txn->setSnapshot(snapshot);
     return {};
 }
 
+void registerInterpreterTransactionControlQuery(InterpreterFactory & factory);
 void registerInterpreterTransactionControlQuery(InterpreterFactory & factory)
 {
     auto create_fn = [] (const InterpreterFactory::Arguments & args)

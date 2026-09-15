@@ -1,11 +1,13 @@
 #pragma once
 
 #include <Processors/Merges/Algorithms/IMergingAlgorithm.h>
+
+#include <Core/Block_fwd.h>
 #include <Processors/IProcessor.h>
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
-#include <Common/logger_useful.h>
 #include <Common/formatReadable.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
@@ -17,20 +19,20 @@ class IMergingTransformBase : public IProcessor
 public:
     IMergingTransformBase(
         size_t num_inputs,
-        const Block & input_header,
-        const Block & output_header,
+        SharedHeader & input_header,
+        SharedHeader & output_header,
         bool have_all_inputs_,
         UInt64 limit_hint_,
         bool always_read_till_end_);
 
     IMergingTransformBase(
-        const Blocks & input_headers,
-        const Block & output_header,
+        SharedHeaders & input_headers,
+        SharedHeader & output_header,
         bool have_all_inputs_,
         UInt64 limit_hint_,
         bool always_read_till_end_);
 
-    OutputPort & getOutputPort() { return outputs.front(); }
+    OutputPort & getOutputPort();
 
     /// Methods to add additional input port. It is possible to do only before the first call of `prepare`.
     void addInput();
@@ -53,6 +55,10 @@ protected:
         bool need_data = false;
         bool no_data = false;
         size_t next_input_to_read = 0;
+
+        /// Inputs to ask for data without waiting for it (read-ahead for sources
+        /// deferred behind virtual rows). See `IMergingAlgorithm::Status::sources_to_prefetch`.
+        std::vector<size_t> inputs_to_prefetch;
 
         IMergingAlgorithm::Inputs init_chunks;
     };
@@ -85,8 +91,8 @@ public:
     template <typename ... Args>
     IMergingTransform(
         size_t num_inputs,
-        const Block & input_header,
-        const Block & output_header,
+        SharedHeader input_header,
+        SharedHeader output_header,
         bool have_all_inputs_,
         UInt64 limit_hint_,
         bool always_read_till_end_,
@@ -98,8 +104,8 @@ public:
 
     template <typename ... Args>
     IMergingTransform(
-        const Blocks & input_headers,
-        const Block & output_header,
+        SharedHeaders input_headers,
+        SharedHeader output_header,
         bool have_all_inputs_,
         UInt64 limit_hint_,
         bool always_read_till_end_,
@@ -125,10 +131,19 @@ public:
             algorithm.consume(state.input_chunk, state.next_input_to_read);
             state.has_input = false;
         }
-        else if (state.no_data && empty_chunk_on_finish)
+        else if (state.no_data)
         {
-            IMergingAlgorithm::Input current_input;
-            algorithm.consume(current_input, state.next_input_to_read);
+            if (empty_chunk_on_finish)
+            {
+                IMergingAlgorithm::Input current_input;
+                algorithm.consume(current_input, state.next_input_to_read);
+            }
+            else
+            {
+                /// The required source finished without data. Let the algorithm release any
+                /// per-source bookkeeping (e.g. a read-ahead slot held for a deferred source).
+                algorithm.onSourceExhausted(state.next_input_to_read);
+            }
             state.no_data = false;
         }
 
@@ -146,6 +161,10 @@ public:
             state.next_input_to_read = status.required_source;
             state.need_data = true;
         }
+
+        if (!status.sources_to_prefetch.empty())
+            state.inputs_to_prefetch.insert(
+                state.inputs_to_prefetch.end(), status.sources_to_prefetch.begin(), status.sources_to_prefetch.end());
 
         if (status.is_finished)
         {
@@ -185,9 +204,9 @@ protected:
         }
         else
         {
-            LOG_DEBUG(log, "{}, {} blocks, {} rows, {} bytes in {} sec., {} rows/sec., {}/sec.",
+            LOG_DEBUG(log, "{}, {} blocks, {} rows, {} bytes in {:.3f} sec., {:.3f} rows/sec., {}/sec.",
                 transform_message, stats.blocks, stats.rows, stats.bytes,
-                seconds, stats.rows / seconds, ReadableSize(stats.bytes / seconds));
+                seconds, static_cast<double>(stats.rows) / seconds, ReadableSize(static_cast<double>(stats.bytes) / seconds));
         }
     }
 

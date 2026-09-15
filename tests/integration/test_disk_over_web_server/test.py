@@ -13,7 +13,6 @@ def cluster():
             "node1",
             main_configs=["configs/storage_conf.xml", "configs/no_async_load.xml"],
             with_nginx=True,
-            use_old_analyzer=True,
         )
         cluster.add_instance(
             "node2",
@@ -21,14 +20,12 @@ def cluster():
             with_nginx=True,
             stay_alive=True,
             with_zookeeper=True,
-            use_old_analyzer=True,
         )
         cluster.add_instance(
             "node3",
             main_configs=["configs/storage_conf_web.xml", "configs/no_async_load.xml"],
             with_nginx=True,
             with_zookeeper=True,
-            use_old_analyzer=True,
         )
 
         cluster.add_instance(
@@ -44,7 +41,6 @@ def cluster():
             "node5",
             main_configs=["configs/storage_conf.xml", "configs/no_async_load.xml"],
             with_nginx=True,
-            use_old_analyzer=True,
         )
 
         cluster.start()
@@ -112,11 +108,12 @@ def test_usage(cluster, node_name):
     for i in range(3):
         node2.query(
             """
+            DROP TABLE IF EXISTS test{};
             CREATE TABLE test{} UUID '{}'
             (id Int32) ENGINE = MergeTree() ORDER BY id
             SETTINGS storage_policy = 'web';
         """.format(
-                i, uuids[i]
+                i, i, uuids[i]
             )
         )
 
@@ -177,7 +174,7 @@ def test_incorrect_usage(cluster):
     assert "Table is read-only" in result
 
     result = node2.query_and_get_error("OPTIMIZE TABLE test0 FINAL")
-    assert "Table is in readonly mode due to static storage" in result
+    assert "Table is in readonly mode" in result
 
     node2.query("DROP TABLE test0 SYNC")
 
@@ -202,7 +199,7 @@ def test_cache(cluster, node_name):
 
         result = node2.query(
             """
-            SYSTEM DROP FILESYSTEM CACHE;
+            SYSTEM CLEAR FILESYSTEM CACHE;
             SELECT count() FROM system.filesystem_cache;
         """
         )
@@ -360,7 +357,7 @@ def test_page_cache(cluster):
 
         def get_profile_events(query_name):
             text = node.query(
-                f"SELECT ProfileEvents.Names, ProfileEvents.Values FROM system.query_log ARRAY JOIN ProfileEvents WHERE query LIKE '% -- {query_name}' AND type = 'QueryFinish'"
+                f"SELECT ProfileEvents.keys, ProfileEvents.values FROM system.query_log ARRAY JOIN ProfileEvents WHERE query LIKE '% -- {query_name}' AND type = 'QueryFinish'"
             )
             res = {}
             for line in text.split("\n"):
@@ -371,23 +368,23 @@ def test_page_cache(cluster):
             return res
 
         ev1 = get_profile_events("test cold cache")
-        assert ev1.get("PageCacheChunkMisses", 0) > 0
+        assert ev1.get("PageCacheMisses", 0) > 0
         assert (
             ev1.get("DiskConnectionsCreated", 0) + ev1.get("DiskConnectionsReused", 0)
             > 0
         )
 
         ev2 = get_profile_events("test warm cache")
-        assert ev2.get("PageCacheChunkDataHits", 0) > 0
-        assert ev2.get("PageCacheChunkMisses", 0) == 0
+        assert ev2.get("PageCacheHits", 0) > 0
+        assert ev2.get("PageCacheMisses", 0) == 0
         assert (
             ev2.get("DiskConnectionsCreated", 0) + ev2.get("DiskConnectionsReused", 0)
             == 0
         )
 
         ev3 = get_profile_events("test no cache")
-        assert ev3.get("PageCacheChunkDataHits", 0) == 0
-        assert ev3.get("PageCacheChunkMisses", 0) == 0
+        assert ev3.get("PageCacheHits", 0) == 0
+        assert ev3.get("PageCacheMisses", 0) == 0
         assert (
             ev3.get("DiskConnectionsCreated", 0) + ev3.get("DiskConnectionsReused", 0)
             > 0

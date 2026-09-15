@@ -1,20 +1,22 @@
-#include "registerTableFunctions.h"
+#include <TableFunctions/registerTableFunctions.h>
 #include <TableFunctions/TableFunctionFactory.h>
 
 namespace DB
 {
-void registerTableFunctions(bool use_legacy_mongodb_integration [[maybe_unused]])
+void registerTableFunctions()
 {
     auto & factory = TableFunctionFactory::instance();
 
     registerTableFunctionMerge(factory);
     registerTableFunctionRemote(factory);
     registerTableFunctionNumbers(factory);
+    registerTableFunctionPrimes(factory);
     registerTableFunctionLoop(factory);
     registerTableFunctionGenerateSeries(factory);
     registerTableFunctionNull(factory);
     registerTableFunctionZeros(factory);
     registerTableFunctionExecutable(factory);
+    registerTableFunctionEval(factory);
     registerTableFunctionFile(factory);
     registerTableFunctionFileCluster(factory);
     registerTableFunctionURL(factory);
@@ -22,14 +24,22 @@ void registerTableFunctions(bool use_legacy_mongodb_integration [[maybe_unused]]
     registerTableFunctionValues(factory);
     registerTableFunctionInput(factory);
     registerTableFunctionGenerate(factory);
+    registerTableFunctionFilesystem(factory);
 #if USE_MONGODB
-    if (use_legacy_mongodb_integration)
-        registerTableFunctionMongoDBPocoLegacy(factory);
-    else
-        registerTableFunctionMongoDB(factory);
+    registerTableFunctionMongoDB(factory);
 #endif
     registerTableFunctionRedis(factory);
+    registerTableFunctionBigQuery(factory);
+
+#if USE_ARROWFLIGHT
+    registerTableFunctionArrowFlight(factory);
+#endif
+
     registerTableFunctionMergeTreeIndex(factory);
+    registerTableFunctionMergeTreeAnalyzeIndexes(factory);
+    registerTableFunctionMergeTreeProjection(factory);
+    registerTableFunctionMergeTreeTextIndex(factory);
+    registerTableFunctionMergeTreeCodecBlockCounts(factory);
     registerTableFunctionFuzzQuery(factory);
 #if USE_RAPIDJSON || USE_SIMDJSON
     registerTableFunctionFuzzJSON(factory);
@@ -66,6 +76,12 @@ void registerTableFunctions(bool use_legacy_mongodb_integration [[maybe_unused]]
     registerTableFunctionObjectStorage(factory);
     registerTableFunctionObjectStorageCluster(factory);
     registerDataLakeTableFunctions(factory);
+    registerDataLakeClusterTableFunctions(factory);
+
+#if USE_YTSAURUS
+    registerTableFunctionYTsaurus(factory);
+#endif
+
 }
 
 }

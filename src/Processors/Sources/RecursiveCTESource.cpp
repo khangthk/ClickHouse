@@ -8,10 +8,12 @@
 #include <Processors/Transforms/SquashingTransform.h>
 #include <Processors/Executors/PullingAsyncPipelineExecutor.h>
 
+#include <QueryPipeline/Chain.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ExpressionActions.h>
 
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/UnionNode.h>
@@ -23,7 +25,13 @@ namespace DB
 {
 namespace Setting
 {
+    extern const SettingsNonZeroUInt64 max_block_size;
+    extern const SettingsNonZeroUInt64 max_insert_block_size;
+    extern const SettingsUInt64 max_insert_block_size_bytes;
     extern const SettingsUInt64 max_recursive_cte_evaluation_depth;
+    extern const SettingsUInt64 min_insert_block_size_rows;
+    extern const SettingsUInt64 min_insert_block_size_bytes;
+    extern const SettingsBool use_strict_insert_block_limits;
 }
 
 namespace ErrorCodes
@@ -36,7 +44,7 @@ namespace ErrorCodes
 namespace
 {
 
-std::vector<TableNode *> collectTableNodesWithStorage(const StoragePtr & storage, IQueryTreeNode * root)
+std::vector<TableNode *> collectTableNodesWithTemporaryTableName(const std::string & temporary_table_name, IQueryTreeNode * root)
 {
     std::vector<TableNode *> result;
 
@@ -49,7 +57,7 @@ std::vector<TableNode *> collectTableNodesWithStorage(const StoragePtr & storage
         nodes_to_process.pop_back();
 
         auto * table_node = subtree_node->as<TableNode>();
-        if (table_node && table_node->getStorageID() == storage->getStorageID())
+        if (table_node && table_node->getTemporaryTableName() == temporary_table_name)
             result.push_back(table_node);
 
         for (auto & child : subtree_node->getChildren())
@@ -67,7 +75,7 @@ std::vector<TableNode *> collectTableNodesWithStorage(const StoragePtr & storage
 class RecursiveCTEChunkGenerator
 {
 public:
-    RecursiveCTEChunkGenerator(Block header_, QueryTreeNodePtr recursive_cte_union_node_)
+    RecursiveCTEChunkGenerator(SharedHeader header_, QueryTreeNodePtr recursive_cte_union_node_)
         : header(std::move(header_))
         , recursive_cte_union_node(std::move(recursive_cte_union_node_))
     {
@@ -75,7 +83,9 @@ public:
         chassert(recursive_cte_union_node_typed.hasRecursiveCTETable());
 
         auto & recursive_cte_table = recursive_cte_union_node_typed.getRecursiveCTETable();
-        recursive_table_nodes = collectTableNodesWithStorage(recursive_cte_table->storage, recursive_cte_union_node.get());
+
+        const auto & cte_name = recursive_cte_union_node_typed.getCTEName();
+        recursive_table_nodes = collectTableNodesWithTemporaryTableName(cte_name, recursive_cte_union_node.get());
         if (recursive_table_nodes.empty())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "UNION query {} is not recursive", recursive_cte_union_node->formatASTForErrorMessage());
 
@@ -171,14 +181,13 @@ private:
                 ErrorCodes::TOO_DEEP_RECURSION,
                 "Maximum recursive CTE evaluation depth ({}) exceeded, during evaluation of {}. Consider raising "
                 "max_recursive_cte_evaluation_depth setting.",
-                recursive_subquery_settings[Setting::max_recursive_cte_evaluation_depth],
+                recursive_subquery_settings[Setting::max_recursive_cte_evaluation_depth].value,
                 recursive_cte_union_node->formatASTForErrorMessage());
 
         auto & query_to_execute = recursive_step > 0 ? recursive_query : non_recursive_query;
         ++recursive_step;
 
         SelectQueryOptions select_query_options;
-        select_query_options.merge_tree_enable_remove_parts_from_snapshot_optimization = false;
 
         const auto & recursive_table_name = recursive_cte_union_node->as<UnionNode &>().getCTEName();
         recursive_query_context->addOrUpdateExternalTable(recursive_table_name, working_temporary_table_holder);
@@ -186,26 +195,59 @@ private:
         auto interpreter = std::make_unique<InterpreterSelectQueryAnalyzer>(query_to_execute, recursive_query_context, select_query_options);
         auto pipeline_builder = interpreter->buildQueryPipeline();
 
-        pipeline_builder.addSimpleTransform([&](const Block & in_header)
+        pipeline_builder.addSimpleTransform([&](const SharedHeader & in_header)
         {
             return std::make_shared<MaterializingTransform>(in_header);
         });
 
         auto convert_to_temporary_tables_header_actions_dag = ActionsDAG::makeConvertingActions(
             pipeline_builder.getHeader().getColumnsWithTypeAndName(),
-            header.getColumnsWithTypeAndName(),
-            ActionsDAG::MatchColumnsMode::Position);
+            header->getColumnsWithTypeAndName(),
+            ActionsDAG::MatchColumnsMode::Position,
+            interpreter->getContext());
         auto convert_to_temporary_tables_header_actions = std::make_shared<ExpressionActions>(std::move(convert_to_temporary_tables_header_actions_dag));
-        pipeline_builder.addSimpleTransform([&](const Block & input_header)
+        pipeline_builder.addSimpleTransform([&](const SharedHeader & input_header)
         {
             return std::make_shared<ExpressionTransform>(input_header, convert_to_temporary_tables_header_actions);
         });
 
-        /// TODO: Support squashing transform
+        /// Squash small chunks before writing them into the intermediate table. A recursive step
+        /// writes one block per produced chunk, and the next step reads the working table block by
+        /// block, so without squashing a step that produces many small chunks leaves many tiny
+        /// blocks behind and the read of the next step degrades.
+        ///
+        /// The settings for the thresholds are modeled after the corresponding settings for INSERT.
+        bool prefers_large_blocks = intermediate_temporary_table_storage->prefersLargeBlocks();
+        size_t squashing_min_block_size_rows = prefers_large_blocks
+            ? recursive_subquery_settings[Setting::min_insert_block_size_rows]
+            : recursive_subquery_settings[Setting::max_block_size];
+        size_t squashing_min_block_size_bytes = prefers_large_blocks
+            ? recursive_subquery_settings[Setting::min_insert_block_size_bytes]
+            : 0;
 
+        /// `addChain` below resizes to a single-stream anyway, so squash to a single stream here too.
+        /// If we wouldn't do that then each of the parallel streams reading the working
+        /// table would only squash their own chunks.
+        pipeline_builder.resize(1);
+        pipeline_builder.addSimpleTransform([&](const SharedHeader & in_header, QueryPipelineBuilder::StreamType stream_type) -> ProcessorPtr
+        {
+            /// Totals and extremes are dropped by the sink below anyways
+            if (stream_type != QueryPipelineBuilder::StreamType::Main)
+                return nullptr;
+
+            return std::make_shared<SquashingTransform>(
+                in_header,
+                squashing_min_block_size_rows,
+                squashing_min_block_size_bytes,
+                recursive_subquery_settings[Setting::max_insert_block_size],
+                recursive_subquery_settings[Setting::max_insert_block_size_bytes],
+                recursive_subquery_settings[Setting::use_strict_insert_block_limits]);
+        });
+
+        const auto metadata_snapshot = intermediate_temporary_table_storage->getInMemoryMetadataPtr(recursive_query_context, false);
         auto intermediate_temporary_table_storage_sink = intermediate_temporary_table_storage->write(
             {},
-            intermediate_temporary_table_storage->getInMemoryMetadataPtr(),
+            metadata_snapshot,
             recursive_query_context,
             false /*async_insert*/);
 
@@ -222,13 +264,14 @@ private:
     {
         /// TODO: Support proper locking
         TableExclusiveLockHolder table_exclusive_lock;
+        const auto metadata_snapshot = temporary_table->getInMemoryMetadataPtr(recursive_query_context, false);
         temporary_table->truncate({},
-            temporary_table->getInMemoryMetadataPtr(),
+            metadata_snapshot,
             recursive_query_context,
             table_exclusive_lock);
     }
 
-    Block header;
+    SharedHeader header;
     QueryTreeNodePtr recursive_cte_union_node;
     std::vector<TableNode *> recursive_table_nodes;
 
@@ -250,7 +293,7 @@ private:
     bool finished = false;
 };
 
-RecursiveCTESource::RecursiveCTESource(Block header, QueryTreeNodePtr recursive_cte_union_node_)
+RecursiveCTESource::RecursiveCTESource(SharedHeader header, QueryTreeNodePtr recursive_cte_union_node_)
     : ISource(header)
     , generator(std::make_unique<RecursiveCTEChunkGenerator>(std::move(header), std::move(recursive_cte_union_node_)))
 {}

@@ -2,6 +2,7 @@
 #include <Processors/Merges/Algorithms/ReplacingSortedAlgorithm.h>
 
 #include <Columns/ColumnsNumber.h>
+#include <Core/Block.h>
 #include <IO/WriteBuffer.h>
 #include <Columns/IColumn.h>
 #include <Processors/Merges/Algorithms/RowRef.h>
@@ -30,27 +31,70 @@ ChunkSelectFinalIndices::ChunkSelectFinalIndices(MutableColumnPtr select_final_i
 }
 
 ReplacingSortedAlgorithm::ReplacingSortedAlgorithm(
-    const Block & header_,
+    SharedHeader header_,
     size_t num_inputs,
     SortDescription description_,
     const String & is_deleted_column,
     const String & version_column,
     size_t max_block_size_rows,
     size_t max_block_size_bytes,
+    std::optional<size_t> max_dynamic_subcolumns_,
     WriteBuffer * out_row_sources_buf_,
     bool use_average_block_sizes,
     bool cleanup_,
-    bool enable_vertical_final_)
-    : IMergingAlgorithmWithSharedChunks(header_, num_inputs, std::move(description_), out_row_sources_buf_, max_row_refs, std::make_unique<MergedData>(use_average_block_sizes, max_block_size_rows, max_block_size_bytes))
-    , cleanup(cleanup_), enable_vertical_final(enable_vertical_final_)
+    bool enable_vertical_final_,
+    bool read_in_reverse_)
+    : IMergingAlgorithmWithSharedChunks(header_, num_inputs, std::move(description_), out_row_sources_buf_, max_row_refs, std::make_unique<MergedData>(use_average_block_sizes, max_block_size_rows, max_block_size_bytes, max_dynamic_subcolumns_))
+    , cleanup(cleanup_), enable_vertical_final(enable_vertical_final_), read_in_reverse(read_in_reverse_)
 {
     if (!is_deleted_column.empty())
-        is_deleted_column_number = header_.getPositionByName(is_deleted_column);
+        is_deleted_column_number = header_->getPositionByName(is_deleted_column);
+
     if (!version_column.empty())
-        version_column_number = header_.getPositionByName(version_column);
+        version_column_number = header_->getPositionByName(version_column);
+
+    /// With a version or an is_deleted column every row of a run must be examined, and row
+    /// sources for a vertical merge must be recorded per row. Without them the only effect of
+    /// processing a row is replacing `selected_row` with it, so runs can be fast-forwarded.
+    /// In the reverse reading order the first row of a run within a source wins instead of the
+    /// last one, so the fast-forward to the last row of the run does not apply either.
+    can_skip_to_run_end = version_column_number == -1 && is_deleted_column_number == -1
+        && out_row_sources_buf == nullptr && !enable_vertical_final && !read_in_reverse;
+    uses_runs_of_equal_keys = can_skip_to_run_end;
+}
+
+void ReplacingSortedAlgorithm::initialize(Inputs inputs)
+{
+    IMergingAlgorithmWithSharedChunks::initialize(std::move(inputs));
+
+    /// Skipping runs needs the queue to actually detect batches. A batch longer than one row is
+    /// not evidence of that on its own: a queue with one cursor left always reports its whole
+    /// remainder as one batch, since there is nothing to compare it against. Without this
+    /// condition the probe for the end of a run would run on every row of a single-input merge -
+    /// which is every `INSERT` into a `ReplacingMergeTree` with `optimize_on_insert` (on by
+    /// default), where `MergeTreeDataWriter::mergeBlock` merges one already sorted block. When
+    /// that block holds no runs of equal keys, the detection is disabled and the merge has to
+    /// cost exactly what it costs with the plain heap.
+    skip_runs_of_equal_keys = can_skip_to_run_end && batch_detection_enabled;
 }
 
 void ReplacingSortedAlgorithm::insertRow()
+{
+    if (is_deleted_column_number != -1)
+    {
+        if (!(cleanup && assert_cast<const ColumnUInt8 &>(*(*selected_row.all_columns)[is_deleted_column_number]).getData()[selected_row.row_num]))
+            insertRowImpl();
+    }
+    else
+    {
+        insertRowImpl();
+    }
+
+    /// insertRowImpl() may has not been called
+    saveChunkForSkippingFinalFromSelectedRow();
+}
+
+void ReplacingSortedAlgorithm::insertRowImpl()
 {
     if (out_row_sources_buf)
     {
@@ -67,6 +111,7 @@ void ReplacingSortedAlgorithm::insertRow()
         /// We just record the position to be selected in the chunk
         if (!selected_row.owned_chunk->replace_final_selection)
             selected_row.owned_chunk->replace_final_selection = ColumnUInt64::create();
+
         selected_row.owned_chunk->replace_final_selection->insert(selected_row.row_num);
 
         /// This is the last row we can select from `selected_row.owned_chunk`, keep it to emit later
@@ -74,7 +119,9 @@ void ReplacingSortedAlgorithm::insertRow()
             to_be_emitted.push(std::move(selected_row.owned_chunk));
     }
     else
+    {
         merged_data->insertRow(*selected_row.all_columns, selected_row.row_num, selected_row.owned_chunk->getNumRows());
+    }
 
     selected_row.clear();
 }
@@ -92,7 +139,8 @@ IMergingAlgorithm::Status ReplacingSortedAlgorithm::merge()
     /// Take the rows in needed order and put them into `merged_columns` until rows no more than `max_block_size`
     while (queue.isValid())
     {
-        SortCursor current = queue.current();
+        auto [current_ptr, current_batch_size] = queue.current();
+        SortCursor current = *current_ptr;
         if (current->isLast() && skipLastRowFor(current->order))
         {
             saveChunkForSkippingFinalFromSource(current.impl->order);
@@ -113,19 +161,57 @@ IMergingAlgorithm::Status ReplacingSortedAlgorithm::merge()
 
             /// Write the data for the previous primary key.
             if (!selected_row.empty())
-            {
-                if (is_deleted_column_number!=-1)
-                {
-                    if (!(cleanup && assert_cast<const ColumnUInt8 &>(*(*selected_row.all_columns)[is_deleted_column_number]).getData()[selected_row.row_num]))
-                        insertRow();
-                }
-                else
-                    insertRow();
-                /// insertRow() may has not been called
-                saveChunkForSkippingFinalFromSelectedRow();
-            }
+                insertRow();
 
             selected_row.clear();
+        }
+
+        if (current->isFirst()
+            && key_differs
+            && is_deleted_column_number == -1 /// Ignore optimization if we need to filter deleted rows.
+            && sources_origin_merge_tree_part_level[current->order] > 0
+            && !skipLastRowFor(current->order) /// Ignore optimization if last row should be skipped.
+            && (queue.size() == 1 || (queue.size() >= 2 && current.totallyLess(queue.nextChild()))))
+        {
+            /// This is special optimization if current cursor is totally less than next cursor
+            /// and current chunk has no duplicates (we assume that parts with non-zero level have no duplicates)
+            /// We want to insert current cursor chunk directly in merged data.
+
+            /// First if merged_data is not empty we need to flush it.
+            /// We will get into the same condition on next merge call.
+            if (merged_data->mergedRows() != 0)
+                return Status(merged_data->pull());
+
+            size_t source_num = current->order;
+            auto current_chunk = std::move(*sources[source_num].chunk);
+            size_t chunk_num_rows = current_chunk.getNumRows();
+
+            /// We will get the next block from the corresponding source, if there is one.
+            queue.removeTop();
+
+            if (enable_vertical_final)
+            {
+                current_chunk.getChunkInfos().add(std::make_shared<ChunkSelectFinalAllRows>());
+                Status status(std::move(current_chunk));
+                status.required_source = source_num;
+                return status;
+            }
+
+            merged_data->insertChunk(std::move(current_chunk), chunk_num_rows);
+            sources[source_num].chunk = {};
+
+            /// Write order of rows for other columns this data will be used in gather stream
+            if (out_row_sources_buf)
+            {
+                /// All rows are not skipped.
+                RowSourcePart row_source(source_num);
+                for (size_t i = 0; i < chunk_num_rows; ++i)
+                    out_row_sources_buf->write(row_source.data);
+            }
+
+            Status status(merged_data->pull());
+            status.required_source = source_num;
+            return status;
         }
 
         /// Initially, skip all rows. Unskip last on insert.
@@ -133,29 +219,85 @@ IMergingAlgorithm::Status ReplacingSortedAlgorithm::merge()
         if (out_row_sources_buf)
             current_row_sources.emplace_back(current.impl->order, true);
 
-        if ((is_deleted_column_number!=-1))
+        if (is_deleted_column_number != -1)
         {
             const UInt8 is_deleted = assert_cast<const ColumnUInt8 &>(*current->all_columns[is_deleted_column_number]).getData()[current->getRow()];
-            if ((is_deleted != 1) && (is_deleted != 0))
+            if (is_deleted > 1)
                 throw Exception(ErrorCodes::INCORRECT_DATA, "Incorrect data: is_deleted = {} (must be 1 or 0).", toString(is_deleted));
         }
 
-        /// A non-strict comparison, since we select the last row for the same version values.
-        if (version_column_number == -1
-            || selected_row.empty()
-            || current->all_columns[version_column_number]->compareAt(
-                current->getRow(), selected_row.row_num,
-                *(*selected_row.all_columns)[version_column_number],
-                /* nan_direction_hint = */ 1) >= 0)
+        bool replace_with_current_row = false;
+        if (selected_row.empty())
+        {
+            replace_with_current_row = true;
+        }
+        else
+        {
+            /// Three-way comparison of the current row's version with the selected row's version.
+            /// Without a version column all rows count as having equal versions, so the selection
+            /// falls through to the physical-order rule below.
+            int version_cmp = version_column_number == -1 ? 0
+                : current->all_columns[version_column_number]->compareAt(
+                    current->getRow(), selected_row.row_num,
+                    *(*selected_row.all_columns)[version_column_number],
+                    /* nan_direction_hint = */ 1);
+
+            if (version_cmp > 0)
+            {
+                replace_with_current_row = true;
+            }
+            else if (version_cmp == 0)
+            {
+                /// Rows with equal versions are selected by their physical order: the row written last wins.
+                /// The queue emits rows with equal sort key ordered by source index, i.e. by data part
+                /// (parts are ordered from the oldest to the newest one), and within one source in the reading order.
+                /// In the direct reading order the current row is always "newer", so it replaces the selected one
+                /// (a non-strict comparison in terms of the version). In the reverse reading order rows within
+                /// one source arrive backwards, so the current row replaces the selected one only when
+                /// it comes from a newer data part.
+                chassert(current_row.source_stream_index >= selected_row.source_stream_index);
+                replace_with_current_row = !read_in_reverse || current_row.source_stream_index > selected_row.source_stream_index;
+            }
+        }
+
+        if (replace_with_current_row)
         {
             max_pos = current_pos;
             saveChunkForSkippingFinalFromSelectedRow();
             setRowRef(selected_row, current);
         }
 
+        /// All rows of one batch come consecutively from the same cursor. When only the last
+        /// row of a run of equal keys is kept and processing a row has no other effects, jump
+        /// to the last row of the run of the current key within the batch: the intermediate
+        /// rows would each merely replace `selected_row` with the next one. Sources with a
+        /// non-zero part level are excluded to keep the exact behavior of
+        /// `rowsHaveDifferentSortColumns`, which does not compare rows of such sources at all.
+        if (skip_runs_of_equal_keys && current_batch_size > 1 && !current->permutation
+            && sources_origin_merge_tree_part_level[current->order] == 0)
+        {
+            size_t run_begin = current->getPos();
+            size_t run_bound = run_begin + current_batch_size;
+
+            /// The last row of the cursor may need to be skipped, leave it to the per-row check.
+            if (run_bound == current->getSize() && skipLastRowFor(current->order))
+                --run_bound;
+
+            if (run_begin + 1 < run_bound)
+            {
+                size_t run_end = getEqualRangeEndAssumeSorted(current->sort_columns, current->desc, run_begin, run_bound);
+                if (run_end > run_begin + 1)
+                {
+                    /// Jump to the last row of the run; the loop processes it as usual.
+                    queue.next(run_end - 1 - run_begin);
+                    continue;
+                }
+            }
+        }
+
         if (!current->isLast())
         {
-            queue.next();
+            queue.next(1);
         }
         else
         {
@@ -172,17 +314,7 @@ IMergingAlgorithm::Status ReplacingSortedAlgorithm::merge()
 
     /// We will write the data for the last primary key.
     if (!selected_row.empty())
-    {
-        if (is_deleted_column_number!=-1)
-        {
-            if (!(cleanup && assert_cast<const ColumnUInt8 &>(*(*selected_row.all_columns)[is_deleted_column_number]).getData()[selected_row.row_num]))
-                insertRow();
-        }
-        else
-            insertRow();
-        /// insertRow() may has not been called
-        saveChunkForSkippingFinalFromSelectedRow();
-    }
+        insertRow();
 
     /// Skipping final: emit the remaining chunks
     if (!to_be_emitted.empty())
